@@ -8,7 +8,9 @@ import itertools
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from src.data_io import read_opportunities, OPPORTUNITIES_DIR
-from src.config import MARKET_DATA_DIR
+from src.config import MARKET_DATA_DIR, MIN_Z_SCORE_ENTRY
+
+METRIC_LABELS = {'asset_swap_spread': 'ASW', 'ytm': 'YTM'}
 
 st.set_page_config(page_title="Scanner", page_icon="🔍", layout="wide")
 st.title("Scanner d'Opportunités RV")
@@ -79,16 +81,126 @@ if selected_issuer != 'Tous':
 
 st.sidebar.header("Filtres")
 trade_types = st.sidebar.multiselect("Type de Trade", df['trade_type'].unique(), default=df['trade_type'].unique())
+metrics = st.sidebar.multiselect("Mesure", df['metric'].unique(), default=df['metric'].unique(), format_func=lambda m: METRIC_LABELS.get(m, m))
 min_score = st.sidebar.slider("Score de Confiance Minimum", 0, 100, 50)
+min_z = st.sidebar.slider("|Z-Score 12M| Minimum", 0.0, 4.0, float(MIN_Z_SCORE_ENTRY), 0.5)
 only_valid_ou = st.sidebar.checkbox("Uniquement OU valide", value=False)
 
-df_filtered = df_filtered[df_filtered['trade_type'].isin(trade_types)]
-df_filtered = df_filtered[df_filtered['confidence_score'] >= min_score]
+df_filtered = df_filtered[df_filtered['trade_type'].isin(trade_types) & df_filtered['metric'].isin(metrics)]
+df_filtered = df_filtered[(df_filtered['confidence_score'] >= min_score) & (df_filtered['zscore_12m'].abs() >= min_z)]
 if only_valid_ou:
     df_filtered = df_filtered[df_filtered['ou_calibration_status'] == 'valid']
 
-# Tri par défaut par score
-df_filtered = df_filtered.sort_values('confidence_score', ascending=False)
+# Tri par défaut par gain net / risque
+df_filtered = df_filtered.sort_values('net_edge_ratio', ascending=False)
+
+# --- Changements vs date précédente (top 20 par gain net, émetteurs communs aux deux dates) ---
+i = dates.index(selected_date)
+with st.expander("Changements vs date précédente", expanded=True):
+    df_prev = load_data(dates[i + 1]) if i + 1 < len(dates) else df.iloc[0:0]
+    common = set(df['issuer']) & set(df_prev['issuer']) if not df_prev.empty else set()
+    if not common:
+        st.info("Pas de date précédente comparable.")
+    else:
+        def top20(d):
+            d = d[d['issuer'].isin(common) & (d['confidence_score'] >= min_score)]
+            return d.drop_duplicates('trade_id').nlargest(20, 'net_edge_ratio').set_index('trade_id')
+        cur_top, prev_top = top20(df), top20(df_prev)
+        cols = ['issuer', 'recommended_direction', 'net_edge_ratio', 'confidence_score']
+        st.caption(f"{dates[i]} vs {dates[i + 1]} - {len(common)} émetteurs comparés")
+        c1, c2 = st.columns(2)
+        c1.write("**Nouveaux dans le top 20**")
+        c1.dataframe(cur_top.loc[cur_top.index.difference(prev_top.index), cols], use_container_width=True)
+        c2.write("**Sortis du top 20**")
+        c2.dataframe(prev_top.loc[prev_top.index.difference(cur_top.index), cols], use_container_width=True)
+
+st.write(f'### Resultats : {len(df_filtered)} opportunites')
+
+# Configuration des colonnes pour un affichage compact
+display_cols = [
+    'trade_id', 'metric', 'issuer', 'recommended_direction', 'net_edge_ratio', 'confidence_score', 'zscore_12m',
+    'carry_roll_adjusted_gap', 'half_life_days', 'net_carry_roll_3m_bps', 'residual_dv01'
+]
+
+# We might not have 'zscore_3m' or 'carry_roll_adjusted_gap' in older datasets, so we check
+available_cols = [c for c in display_cols if c in df_filtered.columns]
+
+df_display = df_filtered[available_cols].reset_index(drop=True)
+
+column_config = {
+    "trade_id": st.column_config.TextColumn("Trade ID", help="Identifiant unique de l'opportunité"),
+    "metric": st.column_config.TextColumn("Mesure"),
+    "issuer": st.column_config.TextColumn("Émetteur"),
+    "trade_type": st.column_config.TextColumn("Type"),
+    "recommended_direction": st.column_config.TextColumn("Direction"),
+    "net_edge_ratio": st.column_config.NumberColumn("Gain net / σ", help="(écart + carry/roll - coûts) / écart-type 12M du spread ; trié par défaut", format="%.2f"),
+    "confidence_score": st.column_config.ProgressColumn(
+        "Score RV",
+        help="Score de confiance composite (0 à 100)",
+        format="%d",
+        min_value=0,
+        max_value=100,
+    ),
+    "target_gap_bps": st.column_config.NumberColumn(
+        "Target Gap (bps)",
+        help="Écart entre spread de marché et cible P-Spline",
+        format="%.2f",
+    ),
+    "carry_roll_adjusted_gap": st.column_config.NumberColumn("Gap Ajusté (bps)", format="%.2f"),
+    "zscore_12m": st.column_config.NumberColumn("Z-Score 12M", format="%.2f"),
+    "net_carry_roll_3m_bps": st.column_config.NumberColumn("Carry+Roll 3M (bps)", format="%.2f"),
+    "residual_dv01": st.column_config.NumberColumn("DV01 résiduel", format="%.2f"),
+    "zscore_3m": st.column_config.NumberColumn("Z-Score 3M", format="%.2f"),
+    "momentum_signal": st.column_config.NumberColumn("Momentum", format="%.2f"),
+    "neighborhood_momentum": st.column_config.NumberColumn("Neigh. Mom.", format="%.2f"),
+    "half_life_days": st.column_config.NumberColumn("Demi-vie (j)", format="%d"),
+    "adf_pvalue": st.column_config.NumberColumn("ADF p-val", format="%.3f"),
+    "ou_calibration_status": st.column_config.TextColumn("Statut OU"),
+}
+
+st.markdown("💡 *Sélectionnez une ligne puis cliquez sur **Ouvrir dans Trade Explorer**.*")
+
+event = st.dataframe(
+    df_display,
+    use_container_width=True,
+    hide_index=True,
+    height=480,
+    on_select="rerun",
+    selection_mode="single-row",
+    column_config=column_config,
+    key="scanner_results_grid"
+)
+
+# Extraction de la ligne sélectionnée
+selected_trade_id = None
+selected_rows = []
+if event and hasattr(event, "selection") and event.selection:
+    selected_rows = getattr(event.selection, "rows", [])
+elif event and isinstance(event, dict) and "selection" in event:
+    selected_rows = event["selection"].get("rows", [])
+
+if selected_rows and len(selected_rows) > 0:
+    row_idx = selected_rows[0]
+    if 0 <= row_idx < len(df_display):
+        selected_trade_id = df_display.iloc[row_idx]['trade_id']
+
+# Action et redirection
+col_info, col_btn = st.columns([3, 1])
+with col_info:
+    if selected_trade_id:
+        trade_data = df_display[df_display['trade_id'] == selected_trade_id].iloc[0]
+        st.success(
+            f"🎯 **Opportunité sélectionnée :** `{selected_trade_id}` | "
+            f"**{trade_data.get('issuer', '')}** ({trade_data.get('trade_type', '')}) | "
+            f"Score: **{trade_data.get('confidence_score', 0):.0f}/100**"
+        )
+    else:
+        st.info("Sélectionnez une opportunité dans le tableau ci-dessus.")
+
+with col_btn:
+    if st.button("🚀 Ouvrir dans Trade Explorer", type="primary", disabled=(selected_trade_id is None), use_container_width=True):
+        st.session_state['selected_trade_id'] = selected_trade_id
+        st.switch_page("pages/2_Trade_Explorer.py")
 
 from src.charts import plot_parallel_coordinates, plot_opportunities_pca
 
@@ -100,8 +212,8 @@ def get_parallel_coords(df):
 def get_pca(df):
     return plot_opportunities_pca(df)
 
-st.write('### Exploration Visuelle')
-if not df_filtered.empty:
+with st.expander('Exploration visuelle'):
+  if not df_filtered.empty:
     viz_col1, viz_col2 = st.columns(2)
     with viz_col1:
         fig_pc = get_parallel_coords(df_filtered)
@@ -109,63 +221,3 @@ if not df_filtered.empty:
     with viz_col2:
         fig_pca = get_pca(df_filtered)
         st.plotly_chart(fig_pca, use_container_width=True)
-
-st.write(f'### Resultats : {len(df_filtered)} opportunites')
-
-# Configuration des colonnes pour un affichage compact
-display_cols = [
-    'trade_id', 'issuer', 'trade_type', 'recommended_direction', 'confidence_score', 
-    'target_gap_bps', 'carry_roll_adjusted_gap', 'zscore_12m', 'zscore_3m', 
-    'momentum_signal', 'neighborhood_momentum', 'half_life_days', 'adf_pvalue', 'ou_calibration_status'
-]
-
-# We might not have 'zscore_3m' or 'carry_roll_adjusted_gap' in older datasets, so we check
-available_cols = [c for c in display_cols if c in df_filtered.columns]
-
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
-
-gb = GridOptionsBuilder.from_dataframe(df_filtered[available_cols])
-gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=20)
-gb.configure_selection('single', use_checkbox=True)
-gb.configure_column("confidence_score", type=["numericColumn"], precision=0)
-gb.configure_column("target_gap_bps", type=["numericColumn"], precision=2)
-if "carry_roll_adjusted_gap" in available_cols:
-    gb.configure_column("carry_roll_adjusted_gap", type=["numericColumn"], precision=2)
-gb.configure_column("zscore_12m", type=["numericColumn"], precision=2)
-if "zscore_3m" in available_cols:
-    gb.configure_column("zscore_3m", type=["numericColumn"], precision=2)
-if "momentum_signal" in available_cols:
-    gb.configure_column("momentum_signal", type=["numericColumn"], precision=2)
-if "neighborhood_momentum" in available_cols:
-    gb.configure_column("neighborhood_momentum", type=["numericColumn"], precision=2)
-gb.configure_column("half_life_days", type=["numericColumn"], precision=0)
-if "adf_pvalue" in available_cols:
-    gb.configure_column("adf_pvalue", type=["numericColumn"], precision=3)
-
-gridOptions = gb.build()
-
-st.write("Sélectionnez une ligne pour l'analyser dans le Trade Explorer.")
-grid_response = AgGrid(
-    df_filtered[available_cols],
-    gridOptions=gridOptions,
-    data_return_mode=DataReturnMode.AS_INPUT,
-    update_mode=GridUpdateMode.SELECTION_CHANGED,
-    fit_columns_on_grid_load=False,
-    theme='streamlit',
-    enable_enterprise_modules=False,
-    height=500,
-    width='100%'
-)
-
-selected = grid_response.get('selected_rows')
-if selected is not None:
-    selected_trade_id = None
-    if isinstance(selected, pd.DataFrame) and not selected.empty:
-        selected_trade_id = selected.iloc[0]['trade_id']
-    elif isinstance(selected, list) and len(selected) > 0:
-        selected_trade_id = selected[0]['trade_id']
-        
-    if selected_trade_id:
-        st.session_state['selected_trade_id'] = selected_trade_id
-        st.switch_page("pages/2_Trade_Explorer.py")
-

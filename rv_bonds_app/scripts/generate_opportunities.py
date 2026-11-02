@@ -6,9 +6,11 @@ import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from src.config import MARKET_DATA_DIR, FITTED_CURVES_DIR, MAX_FLY_WING_SPREAD_YEARS
+from src.config import (MARKET_DATA_DIR, FITTED_CURVES_DIR, MAX_FLY_WING_SPREAD_YEARS, METRIC_TO_BPS,
+                        COINTEGRATION_FILTER_ENABLED, MICRO_RV_N_CLUSTERS)
 from src.data_io import read_market_data, read_fitted_curves, write_opportunities
-from src.trade_definitions import generate_spread_combinations, build_rv_graph, generate_fly_combinations_from_graph, generate_inter_curve_spread_combinations
+from src.trade_definitions import (generate_spread_combinations, build_rv_graph, generate_fly_combinations_from_graph,
+                                   generate_inter_curve_spread_combinations, filter_cointegrated_spreads)
 from src.opportunity_generation import generate_opportunities_for_issuer
 from src.clustering import compute_micro_rv_clusters
 import json
@@ -65,16 +67,19 @@ def generate_opportunities():
             continue
             
         spread_defs = generate_spread_combinations(df_current)
-        df_spread_opps = generate_opportunities_for_issuer(df_market, df_fitted, spread_defs, last_date)
-        graph = build_rv_graph(df_spread_opps)
-        fly_defs = generate_fly_combinations_from_graph(graph, df_current, MAX_FLY_WING_SPREAD_YEARS)
-        df_fly_opps = generate_opportunities_for_issuer(df_market, df_fitted, fly_defs, last_date) if len(fly_defs) > 0 else pd.DataFrame()
-        
         dfs_to_concat = []
-        if df_spread_opps is not None and not df_spread_opps.empty:
-            dfs_to_concat.append(df_spread_opps)
-        if df_fly_opps is not None and not df_fly_opps.empty:
-            dfs_to_concat.append(df_fly_opps)
+        for metric in METRIC_TO_BPS:
+            metric_defs = spread_defs
+            if COINTEGRATION_FILTER_ENABLED:
+                metric_defs = filter_cointegrated_spreads(spread_defs, df_market, metric, last_date)
+                print(f"  [{metric}] cointégration : {len(metric_defs)}/{len(spread_defs)} spreads conservés")
+            if not metric_defs:
+                continue
+            df_spread_opps = generate_opportunities_for_issuer(df_market, df_fitted, metric_defs, last_date, metric)
+            graph = build_rv_graph(df_spread_opps)
+            fly_defs = generate_fly_combinations_from_graph(graph, df_current, MAX_FLY_WING_SPREAD_YEARS)
+            df_fly_opps = generate_opportunities_for_issuer(df_market, df_fitted, fly_defs, last_date, metric) if len(fly_defs) > 0 else pd.DataFrame()
+            dfs_to_concat += [d for d in (df_spread_opps, df_fly_opps) if d is not None and not d.empty]
             
         if dfs_to_concat:
             df_all_opps = pd.concat(dfs_to_concat, ignore_index=True)
@@ -88,7 +93,7 @@ def generate_opportunities():
         
     print("\n" + "="*40 + "\nÉTAPES INTER-COURBES (MICRO-RV SEULEMENT)\n" + "="*40)
     print("Calcul dynamique des clusters Micro-RV (dendrogramme d'ASW sur 1 an)...")
-    clusters = compute_micro_rv_clusters(threshold=1.0)
+    clusters = compute_micro_rv_clusters(threshold=1.0, n_clusters=MICRO_RV_N_CLUSTERS)
     
     # Sauvegarde des clusters
     cluster_file = MARKET_DATA_DIR.parent / "clusters.json"
@@ -110,32 +115,33 @@ def generate_opportunities():
             df_current_1 = current_dict[iss1]
             df_current_2 = current_dict[iss2]
             
-            inter_spread_defs = generate_inter_curve_spread_combinations(df_current_1, df_current_2)
-            
-            if not inter_spread_defs:
-                continue
-                
             df_market_combined = pd.concat([market_dict[iss1], market_dict[iss2]], ignore_index=True)
             df_fitted_combined = pd.concat([fitted_dict[iss1], fitted_dict[iss2]], ignore_index=True)
+            df_current_combined = pd.concat([df_current_1, df_current_2], ignore_index=True).drop_duplicates(subset=['isin'])
             
-            df_inter_opps = generate_opportunities_for_issuer(df_market_combined, df_fitted_combined, inter_spread_defs, global_last_date)
-            
-            if df_inter_opps is not None and not df_inter_opps.empty:
-                # Graph / Fly inter-courbe (Optionnel, mais intéressant)
-                # On peut construire un graphe RV bipartite entre les deux courbes et chercher des flys "papillons inter-courbes"
+            dfs_to_concat = []
+            for metric in METRIC_TO_BPS:
+                inter_spread_defs = generate_inter_curve_spread_combinations(df_current_1, df_current_2, metric=metric)
+                if COINTEGRATION_FILTER_ENABLED:
+                    n_before = len(inter_spread_defs)
+                    inter_spread_defs = filter_cointegrated_spreads(inter_spread_defs, df_market_combined, metric, global_last_date)
+                    print(f"    [{metric}] cointégration : {len(inter_spread_defs)}/{n_before} spreads conservés")
+                if not inter_spread_defs:
+                    continue
+                df_inter_opps = generate_opportunities_for_issuer(df_market_combined, df_fitted_combined, inter_spread_defs, global_last_date, metric)
+                if df_inter_opps is None or df_inter_opps.empty:
+                    continue
+                # Fly inter-courbe : chemins de longueur 2 dans le graphe RV des spreads
                 graph = build_rv_graph(df_inter_opps)
-                df_current_combined = pd.concat([df_current_1, df_current_2], ignore_index=True).drop_duplicates(subset=['isin'])
                 fly_defs = generate_fly_combinations_from_graph(graph, df_current_combined, MAX_FLY_WING_SPREAD_YEARS)
-                df_inter_fly = generate_opportunities_for_issuer(df_market_combined, df_fitted_combined, fly_defs, global_last_date) if len(fly_defs) > 0 else pd.DataFrame()
+                df_inter_fly = generate_opportunities_for_issuer(df_market_combined, df_fitted_combined, fly_defs, global_last_date, metric) if len(fly_defs) > 0 else pd.DataFrame()
+                dfs_to_concat += [d for d in (df_inter_opps, df_inter_fly) if not d.empty]
                 
-                dfs_to_concat = [df_inter_opps]
-                if not df_inter_fly.empty:
-                    dfs_to_concat.append(df_inter_fly)
-                    
+            if dfs_to_concat:
                 df_all_inter = pd.concat(dfs_to_concat, ignore_index=True)
                 df_all_inter['issuer'] = combo_name
                 write_opportunities(df_all_inter, global_last_date)
-                print(f"    -> Succès : {len(df_all_inter)} opportunités ({len(df_inter_opps)} spd, {len(df_inter_fly)} flys).")
+                print(f"    -> Succès : {len(df_all_inter)} opportunités.")
 
     print("\nGénération terminée avec succès.")
 

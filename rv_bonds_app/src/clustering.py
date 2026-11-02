@@ -5,10 +5,17 @@ from scipy.spatial.distance import pdist, squareform
 import pyarrow.parquet as pq
 from .config import FITTED_CURVES_DIR
 
-def compute_micro_rv_clusters(threshold=1.0):
+def issuer_distance(df_pivot: pd.DataFrame) -> np.ndarray:
+    """Distance Micro-RV entre émetteurs (colonnes) : (1 - corrélation) + |écart de niveau moyen| / 15."""
+    dist_corr = np.maximum(1 - df_pivot.corr(method='pearson').values, 0)
+    mean_spreads = df_pivot.mean().values.reshape(-1, 1)
+    return dist_corr + squareform(pdist(mean_spreads, metric='euclidean')) / 15.0
+
+def compute_micro_rv_clusters(threshold=1.0, n_clusters=None):
     """
     Calcule les clusters Micro-RV dynamiques basés sur l'ASW historique 5-10Y.
     Retourne une liste de listes (ex: [['oat', 'cades'], ['bund', 'nether'], ...])
+    Avec n_clusters, l'arbre est coupé en n_clusters groupes au lieu d'une coupe à distance threshold.
     """
     if not FITTED_CURVES_DIR.exists():
         return []
@@ -32,19 +39,13 @@ def compute_micro_rv_clusters(threshold=1.0):
     if len(issuers) < 2:
         return []
         
-    corr_matrix = df_pivot.corr(method='pearson')
-    dist_corr = 1 - corr_matrix.values
-    dist_corr = np.maximum(dist_corr, 0)
-    
-    mean_spreads = df_pivot.mean().values.reshape(-1, 1)
-    dist_abs = squareform(pdist(mean_spreads, metric='euclidean'))
-    dist_abs_norm = dist_abs / 15.0 
-    
-    dist_combined = dist_corr + dist_abs_norm
-    condensed_dist = squareform(dist_combined, checks=False)
+    condensed_dist = squareform(issuer_distance(df_pivot), checks=False)
     
     Z = linkage(condensed_dist, method='ward')
-    cluster_ids = fcluster(Z, t=threshold, criterion='distance')
+    if n_clusters:
+        cluster_ids = fcluster(Z, t=n_clusters, criterion='maxclust')
+    else:
+        cluster_ids = fcluster(Z, t=threshold, criterion='distance')
     
     groups = {}
     for issuer, cid in zip(issuers, cluster_ids):
