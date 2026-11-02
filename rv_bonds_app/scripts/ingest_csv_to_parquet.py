@@ -6,7 +6,7 @@ import pandas as pd
 # Ajout du dossier parent au PYTHON_PATH pour importer src
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from src.config import RAW_DATA_DIR, BASE_DIR
+from src.config import RAW_DATA_DIR, BASE_DIR, FLOATING_COUPON_TYPES
 from src.data_validation import validate_and_clean_market_data
 from src.data_io import write_market_data
 
@@ -71,6 +71,8 @@ def run_ingestion():
                 df_raw['issuer'] = issuer_name
                 
                 if mapping is not None and isin in mapping.index:
+                    if mapping.loc[isin, 'cpn_typ'] in FLOATING_COUPON_TYPES:
+                        continue  # floaters hors périmètre
                     df_raw['bond_name'] = mapping.loc[isin, 'security_name']
                     df_raw['maturity'] = mapping.loc[isin, 'maturity']
                     df_raw['inflation_linked_indicator'] = mapping.loc[isin, 'inflation_linked_indicator']

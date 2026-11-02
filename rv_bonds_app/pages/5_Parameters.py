@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 import sys
 from pathlib import Path
 
@@ -38,10 +39,24 @@ with col3:
     st.write(f"- **Validité OU:** {cfg.SCORE_WEIGHTS['ou_validity']*100}%")
 
 st.markdown("---")
+st.subheader("Repo : spread vs ESTER (bp) par émetteur")
+st.caption("Coût de financement = ESTER + spread. Appliqué immédiatement dans le Scanner et le Trade Explorer "
+           "à la date scannée, sans batch ni recalcul d'historique. 'default' sert aux émetteurs non renseignés.")
+issuers = sorted(d.name.split('=')[1] for d in cfg.MARKET_DATA_DIR.iterdir() if d.is_dir() and d.name.startswith('issuer='))
+saved = cfg.get_repo_spreads()
+df_repo = pd.DataFrame({'issuer': ['default'] + issuers})
+df_repo['spread_bps'] = [saved.get(i, 0.0) for i in df_repo['issuer']]
+edited = st.data_editor(df_repo, hide_index=True, disabled=['issuer'],
+                        column_config={'spread_bps': st.column_config.NumberColumn("Spread (bp)", format="%.1f")})
+if st.button("Enregistrer les spreads de repo"):
+    cfg.set_repo_spreads(dict(zip(edited['issuer'], edited['spread_bps'])))
+    st.success("Spreads enregistrés dans data/settings.json.")
+
+st.markdown("---")
 st.subheader("Chemins des Répertoires")
 st.code(f"""
 Base Dir: {cfg.BASE_DIR}
-Raw Data: {cfg.RAW_DATA_DIR}
+Raw Data: {cfg.get_raw_data_dir()}
 Market Data Parquet: {cfg.MARKET_DATA_DIR}
 Fitted Curves Parquet: {cfg.FITTED_CURVES_DIR}
 Opportunities Parquet: {cfg.OPPORTUNITIES_DIR}

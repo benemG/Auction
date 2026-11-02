@@ -8,18 +8,34 @@ DATA_DIR = BASE_DIR / "data"
 SETTINGS_FILE = DATA_DIR / "settings.json"  # réglages propres à la machine (non versionné)
 DEFAULT_RAW_DATA_DIR = BASE_DIR.parent / "bonds"
 
+def _read_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+def _write_setting(key: str, value) -> None:
+    """Met à jour une clé de settings.json sans écraser les autres."""
+    settings = _read_settings()
+    settings[key] = value
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(settings), encoding="utf-8")
+
 def get_raw_data_dir() -> Path:
     """Dossier des CSV d'origine : réglage utilisateur si présent, sinon dossier par défaut."""
-    try:
-        path = json.loads(SETTINGS_FILE.read_text(encoding="utf-8")).get("raw_data_dir")
-    except (OSError, ValueError):
-        path = None
+    path = _read_settings().get("raw_data_dir")
     return Path(path) if path else DEFAULT_RAW_DATA_DIR
 
 def set_raw_data_dir(path) -> None:
     """Enregistre le dossier des CSV d'origine ; None revient au dossier par défaut."""
-    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(json.dumps({"raw_data_dir": str(path) if path else None}), encoding="utf-8")
+    _write_setting("raw_data_dir", str(path) if path else None)
+
+def get_repo_spreads() -> dict:
+    """Spread de repo vs ESTER en bp par émetteur (clé 'default' pour les autres) ; appliqué à l'affichage du Scanner."""
+    return {k: float(v) for k, v in _read_settings().get("repo_spread_bps", {}).items()}
+
+def set_repo_spreads(spreads: dict) -> None:
+    _write_setting("repo_spread_bps", {k: float(v) for k, v in spreads.items() if v is not None and v == v})
 
 RAW_DATA_DIR = get_raw_data_dir()
 PARQUET_DIR = DATA_DIR / "parquet"

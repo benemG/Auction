@@ -1,4 +1,5 @@
 import numpy as np
+from .config import MIN_HALF_LIFE_EDGE, MAX_HALF_LIFE_EDGE
 
 def calculate_confidence_score(metrics: dict, weights: dict) -> float:
     """
@@ -53,9 +54,24 @@ def calculate_confidence_score(metrics: dict, weights: dict) -> float:
         rmse_subscore = max(0, 100 - max(0, rmse - 2) * 20)
     score += rmse_subscore * weights.get('fit_quality', 0.15)
     
-    # Autres métriques par défaut à 50 si non implémentées/manquantes
-    score += 50 * weights.get('cointegration', 0.20)
-    score += 50 * weights.get('hurst', 0.15)
-    score += 50 * weights.get('half_life', 0.15)
+    # 4. Stationnarité (ADF) : 100 si p <= 5 %, 0 si p >= 10 %
+    p = metrics.get('adf_pvalue', np.nan)
+    adf_subscore = 0 if np.isnan(p) else min(100, max(0, 100 - (p - 0.05) * 2000))
+    score += adf_subscore * weights.get('cointegration', 0.20)
+
+    # 5. Hurst : 100 si H <= 0.3, 0 si H >= 0.5 (marche aléatoire)
+    h = metrics.get('hurst', np.nan)
+    hurst_subscore = 0 if np.isnan(h) else min(100, max(0, (0.5 - h) / 0.2 * 100))
+    score += hurst_subscore * weights.get('hurst', 0.15)
+
+    # 6. Demi-vie : 100 dans [MIN, MAX] jours, décroît en dehors
+    hl = metrics.get('half_life_days', np.nan)
+    if np.isnan(hl) or hl <= 0:
+        hl_subscore = 0
+    elif hl < MIN_HALF_LIFE_EDGE:
+        hl_subscore = 100 * hl / MIN_HALF_LIFE_EDGE
+    else:
+        hl_subscore = 100 * min(1.0, MAX_HALF_LIFE_EDGE / hl)
+    score += hl_subscore * weights.get('half_life', 0.15)
     
     return min(100.0, max(0.0, score))

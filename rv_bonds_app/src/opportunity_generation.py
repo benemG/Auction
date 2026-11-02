@@ -1,20 +1,23 @@
+import json
 import pandas as pd
 import numpy as np
-from .hedge_ratio import compute_spread_hedge_ratio, compute_fly_hedge_ratio, compute_residual_dv01
-from .mean_reversion import MeanReversionModel
-from .momentum import compute_ewmac
+from .hedge_ratio import (compute_spread_hedge_ratio, compute_fly_hedge_ratio, compute_residual_dv01,
+                          parse_coupon, approx_modified_duration)
+from .momentum import compute_ewmac, compute_ewmac_series
+from .mean_reversion import MeanReversionModel, compute_hurst_exponent, compute_adf_pvalue
 from .scoring import calculate_confidence_score
-from .config import TRADING_DAYS_IN_YEAR, SCORE_WEIGHTS
+from .config import TRADING_DAYS_IN_YEAR, SCORE_WEIGHTS, METRIC_TO_BPS
 
-def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.DataFrame, trades_def: list, as_of_date: pd.Timestamp) -> pd.DataFrame:
+def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.DataFrame, trades_def: list, as_of_date: pd.Timestamp, metric: str = 'asset_swap_spread') -> pd.DataFrame:
     """
     Évalue une liste de définitions de trades et produit le Parquet final.
     """
-    import scipy.interpolate as interp
     import os
     from .config import BASE_DIR
     
     results = []
+    scale = METRIC_TO_BPS[metric]
+    id_suffix = '' if metric == 'asset_swap_spread' else f" [{metric.upper()}]"  # garde les trade_id uniques par mesure
     
     # Restreindre aux données historiques et dédupliquer
     df_hist = df_market[df_market['date'] <= as_of_date].drop_duplicates(subset=['date', 'isin']).copy()
@@ -26,6 +29,16 @@ def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.Dat
     
     current_market = df_hist[df_hist['date'] == as_of_date].set_index('isin')
     current_fit = df_hist_fit[df_hist_fit['date'] == as_of_date].set_index('isin')
+
+    # Duration et DV01 absents des données : approximation en forme fermée (coupon lu dans le nom)
+    if 'modified_duration' in current_market.columns and 'maturity' in current_market.columns:
+        ttm_mkt = (pd.to_datetime(current_market['maturity']) - pd.to_datetime(as_of_date)).dt.days / 365.25
+        approx = [approx_modified_duration(y, parse_coupon(n), t)
+                  for y, n, t in zip(current_market['ytm'], current_market['bond_name'], ttm_mkt)]
+        current_market['modified_duration'] = current_market['modified_duration'].fillna(pd.Series(approx, index=current_market.index))
+        if 'dv01' in current_market.columns:
+            # €/bp pour 1M de nominal = prix × duration modifiée
+            current_market['dv01'] = current_market['dv01'].fillna(current_market['modified_duration'] * current_market['price_clean'])
     
     # --- Chargement du Taux ESTER ---
     ester_rate = 3.40 # fallback
@@ -40,133 +53,77 @@ def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.Dat
     except Exception as e:
         print(f"Attention: Impossible de charger ecb_rates.parquet ({e}), fallback {ester_rate}%")
         
-    for trade in trades_def:
-        metric = 'asset_swap_spread' # On force ASW pour l'exemple, extensible à YTM/Z-spread
-        
-        # Helper pour construire l'interpolateur de yield (pour le rolldown)
-        # On suppose que le yield de la courbe est stocké dans current_fit.
-        # S'il n'y a pas 'ytm_fitted', on fallback sur 'asset_swap_spread_fitted' ou 0
-        fit_metric = 'ytm_fitted' if 'ytm_fitted' in current_fit.columns else f"{metric}_fitted"
-        ttms = current_fit['ttm_years'].values
-        yields = current_fit[fit_metric].values
-        valid_mask = ~np.isnan(ttms) & ~np.isnan(yields)
-        
-        if valid_mask.sum() > 2:
-            sort_idx = np.argsort(ttms[valid_mask])
-            curve_interp = interp.interp1d(ttms[valid_mask][sort_idx], yields[valid_mask][sort_idx], kind='linear', fill_value="extrapolate")
-        else:
-            curve_interp = None
+    # Courbe de yield fittée par émetteur (le roll ne doit pas mélanger deux courbes)
+    curves = {iss: (g['ttm_years'].values, g['ytm_fitted'].values)
+              for iss, g in current_fit.dropna(subset=['ttm_years', 'ytm_fitted']).sort_values('ttm_years').groupby('issuer')}
 
-        if trade['trade_type'] == 'spread':
-            isin1, isin2 = trade['bond1_isin'], trade['bond2_isin']
-            
-            if isin1 not in current_market.index or isin2 not in current_market.index:
-                continue
-                
-            dv01_1 = current_market.loc[isin1, 'dv01'] if 'dv01' in current_market.columns else 1.0
-            dv01_2 = current_market.loc[isin2, 'dv01'] if 'dv01' in current_market.columns else 1.0
-            
-            n1, n2 = compute_spread_hedge_ratio(dv01_1, dv01_2)
-            
-            # Series historiques
-            try:
-                ts_market = n1 * df_hist_pivot[metric][isin1] + n2 * df_hist_pivot[metric][isin2]
-                ts_fitted = n1 * df_fit_pivot[f"{metric}_fitted"][isin1] + n2 * df_fit_pivot[f"{metric}_fitted"][isin2]
-            except KeyError:
-                continue
-                
-            current_spread = ts_market.iloc[-1]
-            current_target = ts_fitted.iloc[-1]
-            
-            rmse_1 = current_fit.loc[isin1, f"{metric}_rmse"] if f"{metric}_rmse" in current_fit.columns else np.nan
-            rmse_2 = current_fit.loc[isin2, f"{metric}_rmse"] if f"{metric}_rmse" in current_fit.columns else np.nan
-            rmse = np.nanmean([rmse_1, rmse_2])
-            
-            legs = [n1, n2]
-            dv01s = [dv01_1, dv01_2]
-            isins = [isin1, isin2]
-            ttm_list = [trade['ttm_a'], trade['ttm_b']]
-            
-        elif trade['trade_type'] == 'fly':
-            isin1, isin2, isin3 = trade['bond1_isin'], trade['bond2_isin'], trade['bond3_isin']
-            
-            if isin1 not in current_market.index or isin2 not in current_market.index or isin3 not in current_market.index:
-                continue
-                
-            dv01_1 = current_market.loc[isin1, 'dv01'] if 'dv01' in current_market.columns else 1.0
-            dv01_2 = current_market.loc[isin2, 'dv01'] if 'dv01' in current_market.columns else 1.0
-            dv01_3 = current_market.loc[isin3, 'dv01'] if 'dv01' in current_market.columns else 1.0
-            
-            n1, n2, n3 = compute_fly_hedge_ratio(dv01_1, dv01_2, dv01_3, trade['ttm_a'], trade['ttm_b'], trade['ttm_c'])
-            
-            try:
-                ts_market = n1 * df_hist_pivot[metric][isin1] + n2 * df_hist_pivot[metric][isin2] + n3 * df_hist_pivot[metric][isin3]
-                ts_fitted = n1 * df_fit_pivot[f"{metric}_fitted"][isin1] + n2 * df_fit_pivot[f"{metric}_fitted"][isin2] + n3 * df_fit_pivot[f"{metric}_fitted"][isin3]
-            except KeyError:
-                continue
-                
-            current_spread = ts_market.iloc[-1]
-            current_target = ts_fitted.iloc[-1]
-            
-            rmses = [
-                current_fit.loc[isin1, f"{metric}_rmse"] if f"{metric}_rmse" in current_fit.columns else np.nan,
-                current_fit.loc[isin2, f"{metric}_rmse"] if f"{metric}_rmse" in current_fit.columns else np.nan,
-                current_fit.loc[isin3, f"{metric}_rmse"] if f"{metric}_rmse" in current_fit.columns else np.nan
-            ]
-            rmse = np.nanmean(rmses)
-            
-            legs = [n1, n2, n3]
-            dv01s = [dv01_1, dv01_2, dv01_3]
-            isins = [isin1, isin2, isin3]
-            ttm_list = [trade['ttm_a'], trade['ttm_b'], trade['ttm_c']]
-            
-        else:
+    for trade in trades_def:
+        
+        isins = [trade[k] for k in ('bond1_isin', 'bond2_isin', 'bond3_isin') if trade.get(k)]
+        ttm_list = [trade.get(k) for k in ('ttm_a', 'ttm_b', 'ttm_c')][:len(isins)]
+        if trade['trade_type'] not in ('spread', 'fly') or any(i not in current_market.index for i in isins):
             continue
-            
+
+        dv01s = [current_market.loc[i, 'dv01'] if 'dv01' in current_market.columns else 1.0 for i in isins]
+        if trade['trade_type'] == 'spread':
+            legs = list(compute_spread_hedge_ratio(*dv01s))
+            sw = [1.0, -1.0]
+        else:
+            legs = list(compute_fly_hedge_ratio(*dv01s, *ttm_list))
+            if any(np.isnan(d) for d in dv01s):
+                sw = [legs[0], -1.0, legs[2]]  # poids de maturité des ailes, belly à -1
+            else:
+                # Ailes pondérées en DV01 (belly à -1) : le spread suivi correspond au P&L de la position couverte
+                sw = [l * d / (-legs[1] * dv01s[1]) for l, d in zip(legs, dv01s)]
+        # legs = nominaux (DV01-neutres) pour le sizing ; sw = poids qui construisent le spread en bps
+
+        try:
+            ts_market = scale * sum(w * df_hist_pivot[metric][i] for w, i in zip(sw, isins))
+            ts_fitted = scale * sum(w * df_fit_pivot[f"{metric}_fitted"][i] for w, i in zip(sw, isins))
+        except KeyError:
+            continue
+
+        current_spread = ts_market.iloc[-1]
+        current_target = ts_fitted.iloc[-1]
+        rmse = scale * current_fit.reindex(isins)[f"{metric}_rmse"].mean() if f"{metric}_rmse" in current_fit.columns else np.nan
+
         # Filtre : Minimum 12 mois d'historique
         if len(ts_market.dropna()) < 252:
             continue
-            
+
         # Calcul du spread "Spread vs Fitted" (SvF) pour l'historique
         ts_svf = ts_market - ts_fitted
         current_svf = current_spread - current_target
-            
-        # Z-Score sur 12 mois (252 jours)
         ts_svf_12m = ts_svf.dropna().tail(252)
+
+        # Calibration OU : une seule cible (moyenne OU, sinon moyenne 12M) pour z-score, gap et direction
+        ou = MeanReversionModel()
+        state = ou.calibrate_ou_model(ts_svf_12m, dt=1.0/TRADING_DAYS_IN_YEAR)
+        mu = state['mu'] if state['status'] == 'valid' else ts_svf_12m.mean()
+        if np.isnan(current_svf) or np.isnan(mu):
+            continue
+        fht = ou.compute_first_hitting_time(current_svf)
+
         if len(ts_svf_12m) > 10:
-            zscore = (current_svf - ts_svf_12m.mean()) / ts_svf_12m.std()
             daily_vol = ts_svf_12m.std()
+            zscore = (current_svf - mu) / daily_vol
         else:
-            zscore = np.nan
-            daily_vol = np.nan
-            
-        # Z-Score sur 3 mois (63 jours)
+            zscore = daily_vol = np.nan
+
         ts_svf_3m = ts_svf.dropna().tail(63)
-        if len(ts_svf_3m) > 10:
-            zscore_3m = (current_svf - ts_svf_3m.mean()) / ts_svf_3m.std()
-        else:
-            zscore_3m = np.nan
-            
+        zscore_3m = (current_svf - ts_svf_3m.mean()) / ts_svf_3m.std() if len(ts_svf_3m) > 10 else np.nan
+
         # Momentum EWMAC
         ts_clean = ts_svf.dropna()
         momentum_signal = compute_ewmac(ts_clean)
         try:
-            from .momentum import compute_ewmac_series
             momentum_series = compute_ewmac_series(ts_clean).tolist()
         except Exception:
             momentum_series = []
-            
-        # Calibration OU
-        ou = MeanReversionModel()
-        state = ou.calibrate_ou_model(ts_svf_12m, dt=1.0/TRADING_DAYS_IN_YEAR)
-        
-        fht = ou.compute_first_hitting_time(current_svf)
-        
-        from .mean_reversion import compute_hurst_exponent, compute_adf_pvalue
+
         hurst = compute_hurst_exponent(ts_svf_12m)
         adf_pvalue = compute_adf_pvalue(ts_svf_12m)
-        
-        # Consolidation des métriques pour le score
+
         metrics = {
             'ou_calibration_status': state['status'],
             'half_life_days': ou.compute_half_life() * TRADING_DAYS_IN_YEAR if state['status'] == 'valid' else np.nan,
@@ -177,45 +134,48 @@ def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.Dat
             'adf_pvalue': adf_pvalue,
             'momentum_signal': momentum_signal
         }
-        
-        target_gap = current_target - current_spread
+
+        # Cible = courbe P-spline + écart moyen (mu) ; gap > 0 : on attend un élargissement du spread
+        target = current_target + mu
+        target_gap = target - current_spread
         direction = 'long_spread' if target_gap > 0 else 'short_spread'
-        
-        # --- CALCUL CARRY & ROLLDOWN TRAP AVOIDANCE ---
+        dir_sign = np.sign(target_gap)
+
+        # --- CARRY & ROLLDOWN (3M), tout en bps de yield-équivalent comme target_gap ---
+        # carry% / duration = bps de yield équivalent ; le roll (Δ yield courbe) est déjà en bps.
+        # Position en bonds = -dir_sign * sw (long_spread = short bond1 / long bond2).
+        horizon_years = 0.25
         net_carry_roll_3m_bps = 0.0
         total_bid_ask_cost_bps = 0.0
-        horizon_years = 0.25 # 3 mois
-        for w, isin, ttm in zip(legs, isins, ttm_list):
-            # Bid/Ask spread proxy (si non disponible, on assume 1 bps par jambe)
+        leg_issuers, leg_repo_sens = [], []  # pour apply_repo_spreads : spread de repo appliqué à l'affichage seulement
+        for w, isin, ttm in zip(sw, isins, ttm_list):
             bid_ask_spread = current_market.loc[isin, 'bid_ask_spread'] if 'bid_ask_spread' in current_market.columns else 1.0
             total_bid_ask_cost_bps += abs(w) * (bid_ask_spread / 2.0)
-            
-            # Repo rate spécifique si disponible
+
             repo_rate = current_market.loc[isin, 'repo_rate'] if 'repo_rate' in current_market.columns else ester_rate
-            
-            # Carry
-            ytm_val = current_market.loc[isin, 'ytm'] if 'ytm' in current_market.columns else current_market.loc[isin, metric]
-            carry_bps_annual = (ytm_val - repo_rate) * 100 
-            carry_bps_3m = carry_bps_annual * horizon_years
-            
-            # Rolldown
-            roll_bps_3m = 0.0
-            if curve_interp is not None and ttm > horizon_years:
-                yield_now = curve_interp(ttm)
-                yield_future = curve_interp(ttm - horizon_years)
-                roll_yield_diff = (yield_now - yield_future) * 100
-                dv01 = current_market.loc[isin, 'dv01'] if 'dv01' in current_market.columns else 1.0
-                roll_bps_3m = roll_yield_diff * dv01
-                
-            net_carry_roll_3m_bps += w * (carry_bps_3m + roll_bps_3m)
-            
-        # Adjusted gap = Target - friction costs + net carry roll
-        expected_pnl_bps = target_gap + net_carry_roll_3m_bps
-        carry_roll_adjusted_gap = expected_pnl_bps - np.sign(expected_pnl_bps) * total_bid_ask_cost_bps
+            dur = current_market.loc[isin, 'modified_duration'] if 'modified_duration' in current_market.columns else np.nan
+            if np.isnan(dur):
+                dur = ttm  # shortcut: duration ≈ maturité (zéro-coupon), surestime la duration des coupons
+            carry_bps = (current_market.loc[isin, 'ytm'] - repo_rate) * horizon_years * 100 / dur
+
+            roll_bps = 0.0
+            x, y = curves.get(current_fit.loc[isin, 'issuer'], (None, None))
+            if x is not None and ttm > horizon_years:
+                # shortcut: np.interp extrapole à plat sous la 1re maturité (roll sous-estimé), à raffiner si besoin
+                roll_bps = (np.interp(ttm, x, y) - np.interp(ttm - horizon_years, x, y)) * 100
+
+            net_carry_roll_3m_bps += -dir_sign * w * (carry_bps + roll_bps)
+            leg_issuers.append(str(current_market.loc[isin, 'issuer']) if 'issuer' in current_market.columns else '')
+            # d(gain net)/d(spread repo en bp) : carry_bps = (ytm - repo)·h·100/dur, donc -h/dur par bp, signé par la position
+            leg_repo_sens.append(float(dir_sign * w * horizon_years / dur))
+
+        net_edge_bps = abs(target_gap) + net_carry_roll_3m_bps - total_bid_ask_cost_bps  # >0 : gain net attendu
+        carry_roll_adjusted_gap = dir_sign * net_edge_bps
+        net_edge_ratio = net_edge_bps / daily_vol if daily_vol > 0 else np.nan  # gain net en écarts-types du spread
 
         res = {
             'as_of_date': as_of_date,
-            'trade_id': trade['trade_id'],
+            'trade_id': trade['trade_id'] + id_suffix,
             'trade_type': trade['trade_type'],
             'metric': metric,
             'bond1_isin': trade['bond1_isin'],
@@ -224,14 +184,18 @@ def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.Dat
             'bond1_name': trade['bond1_name'],
             'bond2_name': trade['bond2_name'],
             'bond3_name': trade['bond3_name'],
-            'leg_weights': str(legs),
+            'leg_weights': str([float(w) for w in sw]),  # floats Python : relu par ast.literal_eval dans Trade Explorer
+            'hedge_nominals': str([float(n) for n in legs]),
             'spread_market_bps': current_spread,
             'spread_fitted_bps': current_target,
-            'spread_target_bps': current_target,
+            'spread_target_bps': target,
             'target_gap_bps': target_gap,
             'net_carry_roll_3m_bps': net_carry_roll_3m_bps,
+            'leg_issuers': json.dumps(leg_issuers),
+            'leg_repo_sens': json.dumps(leg_repo_sens),
             'bid_ask_cost_bps': total_bid_ask_cost_bps,
             'carry_roll_adjusted_gap': carry_roll_adjusted_gap,
+            'net_edge_ratio': net_edge_ratio,
             'ou_long_run_mean_bps': state['mu'],
             'ou_calibration_status': state['status'],
             'ou_theta': state['theta'],
@@ -257,6 +221,12 @@ def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.Dat
     if df_res.empty:
         return df_res
         
+    # Deux ISIN peuvent partager le même nom : on ajoute les ISIN aux identifiants en double pour les garder uniques
+    dup = df_res['trade_id'].duplicated(keep=False)
+    if dup.any():
+        tags = df_res.loc[dup, ['bond1_isin', 'bond2_isin', 'bond3_isin']].apply(lambda r: '/'.join(i for i in r if pd.notna(i)), axis=1)
+        df_res.loc[dup, 'trade_id'] += ' (' + tags + ')'
+
     # --- POST-PROCESSING: Neighborhood Momentum & Scoring ---
     neighborhood_momentums = []
     confidence_scores = []
@@ -290,5 +260,25 @@ def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.Dat
     df_res['neighborhood_momentum'] = neighborhood_momentums
     df_res['confidence_score'] = confidence_scores
     df_res = df_res.drop(columns=['metrics_dict'])
-    
+
     return df_res
+
+
+def apply_repo_spreads(df: pd.DataFrame, spreads: dict) -> pd.DataFrame:
+    """
+    Ajoute à l'affichage l'effet d'un spread de repo (bp vs ESTER) par émetteur sur le carry et le gain net,
+    à partir des sensibilités stockées par trade. Aucun recalcul d'historique : la faisabilité financière
+    ne compte qu'à la date scannée. Sans effet sur les parquets antérieurs (colonnes absentes) ou si tout est nul.
+    """
+    if df.empty or 'leg_repo_sens' not in df.columns or not any(spreads.values()):
+        return df
+    default = spreads.get('default', 0.0)
+    # Dates générées avant cette colonne : NaN dans un schéma Parquet unifié, pas d'ajustement
+    adj = np.array([sum(s * spreads.get(i, default) for s, i in zip(json.loads(sens), json.loads(iss)))
+                    if isinstance(sens, str) else 0.0
+                    for sens, iss in zip(df['leg_repo_sens'], df['leg_issuers'])])
+    df = df.copy()
+    df['net_carry_roll_3m_bps'] += adj
+    df['carry_roll_adjusted_gap'] += np.sign(df['target_gap_bps']) * adj
+    df['net_edge_ratio'] += adj / df['daily_vol_bps']
+    return df

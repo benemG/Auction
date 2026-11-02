@@ -26,6 +26,7 @@ Cette application vous permet d'explorer les opportunités de trading de type Re
 2. **Trade Explorer** : Analyse détaillée d'un trade (Historique, Modèle OU).
 3. **Curve Diagnostics** : Visualisation du fit P-Spline.
 4. **Parameters** : Paramètres de configuration du système.
+5. **Source Data** : Dossier des données de marché d'origine (CSV).
 """)
 
 st.sidebar.info("Modèles : P-Spline pour la courbe, OU (Ornstein-Uhlenbeck) MLE pour le signal.")

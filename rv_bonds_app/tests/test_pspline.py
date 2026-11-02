@@ -29,3 +29,19 @@ def test_pspline_fitter():
     y_fit, is_extra = fitter.compute_fitted_yield(np.array([10.0, 25.0]))
     assert is_extra[0] == False
     assert is_extra[1] == True
+
+def test_loo_residuals_match_true_refit():
+    rng = np.random.default_rng(0)
+    ref_date = '2023-01-01'
+    maturities = pd.date_range(start='2024-01-01', periods=15, freq='YE')
+    rates = 0.02 + 0.01 * np.log(np.arange(1, 16)) + rng.normal(0, 0.001, 15)
+    full = PSplineCurveFitter(n_knots=10, lambda_param=1.0)
+    full.load_market_data(ref_date, maturities, rates)
+    assert full.fit_curve()
+    # Points intérieurs seulement : retirer un bord déplace les noeuds (base différente)
+    for i in (3, 7, 11):
+        sub = PSplineCurveFitter(n_knots=10, lambda_param=1.0)
+        sub.load_market_data(ref_date, maturities.delete(i), np.delete(rates, i))
+        assert sub.fit_curve()
+        pred, _ = sub.compute_fitted_yield(full.ttm_clean[i])
+        assert full.loo_residuals[i] == pytest.approx(rates[i] - pred, abs=1e-8)

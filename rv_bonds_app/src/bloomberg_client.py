@@ -44,28 +44,31 @@ def fetch_bond_market_data(isins: List[str], start_date: str, end_date: Optional
         end_date=end_date
     )
     
+    if hasattr(df_bbg, 'to_pandas'):  # xbbg 1.x peut renvoyer un autre backend
+        df_bbg = df_bbg.to_pandas()
     if df_bbg.empty:
         return pd.DataFrame()
-        
-    # Le DataFrame renvoyé a un MultiIndex en colonnes (Ticker, Field)
-    # On va le formater (stack) pour avoir les colonnes: date, ticker, px_last, etc.
-    df_formatted = df_bbg.stack(level=0, future_stack=True).reset_index()
-    # future_stack=True gère correctement le nommage de l'index dans pandas moderne.
-    
-    # Renommer les colonnes
-    rename_map = {
-        'index': 'date',
-        'level_1': 'bbg_ticker',
-        'PX_LAST': 'price_clean',
-        'YLD_YTM_MID': 'ytm',
-        'ASW_SPD_MID': 'asset_swap_spread',
-        'Z_SPRD_MID': 'z_spread'
-    }
-    
-    # Dans les anciennes versions de pandas, l'index de date peut s'appeler différemment
-    if 'date' not in df_formatted.columns and df_formatted.columns[0] != 'index':
-        rename_map[df_formatted.columns[0]] = 'date'
-        
-    df_formatted = df_formatted.rename(columns=rename_map)
-    
-    return df_formatted
+
+    fields_map = {'PX_LAST': 'price_clean', 'YLD_YTM_MID': 'ytm',
+                  'ASW_SPD_MID': 'asset_swap_spread', 'Z_SPRD_MID': 'z_spread'}
+
+    if isinstance(df_bbg.columns, pd.MultiIndex):
+        # xbbg 0.7.x : format large, colonnes (ticker, field)
+        df_formatted = df_bbg.stack(level=0, future_stack=True)
+        df_formatted.index.names = ['date', 'bbg_ticker']
+        df_formatted = df_formatted.reset_index()
+        df_formatted.columns = [str(c).upper() if str(c).upper() in fields_map else c for c in df_formatted.columns]
+    else:
+        # xbbg 1.x : format long (ticker, date, field, value), valeurs en texte
+        df_bbg.columns = [str(c).lower() for c in df_bbg.columns]
+        df_bbg['value'] = pd.to_numeric(df_bbg['value'], errors='coerce')
+        df_bbg['field'] = df_bbg['field'].str.upper()
+        df_formatted = (df_bbg.pivot_table(index=['date', 'ticker'], columns='field', values='value', aggfunc='last')
+                        .reset_index().rename_axis(columns=None).rename(columns={'ticker': 'bbg_ticker'}))
+
+    df_formatted = df_formatted.rename(columns=fields_map)
+    df_formatted['date'] = pd.to_datetime(df_formatted['date'])
+    for col in fields_map.values():
+        if col not in df_formatted.columns:
+            df_formatted[col] = float('nan')
+    return df_formatted[['date', 'bbg_ticker'] + list(fields_map.values())]

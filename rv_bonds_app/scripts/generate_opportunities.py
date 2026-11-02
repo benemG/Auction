@@ -20,6 +20,8 @@ def filter_current(df):
         df = df[df['ttm_years'] >= 1.0]
     if 'inflation_linked_indicator' in df.columns:
         df = df[df['inflation_linked_indicator'].astype(str).str.upper() != 'Y']
+    if 'is_extrapolated' in df.columns:
+        df = df[~df['is_extrapolated'].astype(bool)]  # bords de courbe : dans le fit, pas tradés
     return df
 
 def generate_opportunities():

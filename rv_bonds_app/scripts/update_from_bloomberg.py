@@ -31,6 +31,10 @@ def update_from_bloomberg(end_date: str = None):
     df_active = df_ref[df_ref['maturity_dt'].dt.date >= today].copy()
     print(f"Obligations actives (non échues) dans le référentiel : {len(df_active)}")
     
+    if not RAW_DATA_DIR.is_dir():
+        print(f"Erreur: dossier des CSV {RAW_DATA_DIR} introuvable (réglable dans la page Source Data).")
+        return
+
     # Construire la cartographie isin -> sous-dossier émetteur existant
     isin_to_folder = {}
     for issuer_dir in RAW_DATA_DIR.iterdir():
@@ -108,7 +112,12 @@ def update_from_bloomberg(end_date: str = None):
         return
         
     df_bbg = pd.concat(df_results, ignore_index=True)
+    # Les jours sans cotation reviennent en NaN : ils ne doivent pas écraser l'historique existant
+    df_bbg = df_bbg.dropna(subset=['price_clean', 'ytm'])
     df_bbg['isin'] = df_bbg['bbg_ticker'].map(ticker_to_isin)
+    unmapped = df_bbg['isin'].isna().sum()
+    if unmapped:
+        print(f"Attention: {unmapped} lignes Bloomberg ignorées (ticker non reconnu).")
     
     # Sauvegarde des CSV
     print(f"\nÉcriture et fusion dans les CSV...")
@@ -135,18 +144,19 @@ def update_from_bloomberg(end_date: str = None):
         
         df_export['date'] = pd.to_datetime(df_export['date']).dt.strftime('%Y-%m-%d')
         
+        cols = ['date', 'px_last', 'yld_ytm_mid', 'asset_swap_spd_mid', 'z_sprd_mid']
         if csv_path.exists():
             try:
-                df_existing = pd.read_csv(csv_path, sep=';', header=None, skiprows=1, names=['date', 'px_last', 'yld_ytm_mid', 'asset_swap_spd_mid', 'z_sprd_mid'])
-            except Exception:
-                df_existing = pd.DataFrame(columns=['date', 'px_last', 'yld_ytm_mid', 'asset_swap_spd_mid', 'z_sprd_mid'])
-                
-            df_combined = pd.concat([df_existing, df_export]).drop_duplicates(subset=['date'], keep='last')
-            df_combined = df_combined.sort_values('date')
-            df_combined.to_csv(csv_path, sep=';', index=False, header=['', 'px_last', 'yld_ytm_mid', 'asset_swap_spd_mid', 'z_sprd_mid'])
-        else:
-            df_export.to_csv(csv_path, sep=';', index=False, header=['', 'px_last', 'yld_ytm_mid', 'asset_swap_spd_mid', 'z_sprd_mid'])
-            
+                df_existing = pd.read_csv(csv_path, sep=';', header=None, skiprows=1, names=cols)
+            except Exception as e:
+                print(f"Erreur de lecture de {csv_path.name} ({e}) : fichier laissé intact.")
+                continue
+            df_export = pd.concat([df_existing, df_export]).drop_duplicates(subset=['date'], keep='last').sort_values('date')
+
+        tmp_path = csv_path.with_suffix('.csv.tmp')  # écriture atomique : pas de CSV tronqué si crash
+        df_export.to_csv(tmp_path, sep=';', index=False, header=[''] + cols[1:])
+        os.replace(tmp_path, csv_path)
+
         updated_files += 1
         
     print(f"{updated_files} fichiers CSV mis à jour avec succès.")

@@ -41,18 +41,13 @@ class PSplineCurveFitter:
         
         ttm_years = (maturity_dates - reference_date).dt.days / 365.25
         
-        # Filtre les valeurs valides
+        # Filtre les valeurs valides ; self.mask réaligne les sorties sur l'ordre d'entrée
         rates = np.array(rates)
-        mask = (ttm_years > 0) & np.isfinite(rates)
-        
-        self.ttm_clean = ttm_years[mask].values
-        self.rates_clean = rates[mask]
-        
-        # Tri croissant
-        sort_idx = np.argsort(self.ttm_clean)
-        self.ttm_clean = self.ttm_clean[sort_idx]
-        self.rates_clean = self.rates_clean[sort_idx]
-        
+        self.mask = ((ttm_years > 0) & np.isfinite(rates)).values
+
+        self.ttm_clean = ttm_years.values[self.mask]
+        self.rates_clean = rates[self.mask]
+
         return len(self.rates_clean)
         
     def fit_curve(self):
@@ -98,23 +93,29 @@ class PSplineCurveFitter:
         DtD = D.T @ D
         Bty = B.T @ self.rates_clean
         
+        A = BtB + self.lambda_param * DtD
         try:
-            self.theta = np.linalg.solve(BtB + self.lambda_param * DtD, Bty)
+            A_inv = np.linalg.inv(A)
         except np.linalg.LinAlgError:
             try:
                 # Fallback sur pseudo-inverse
-                self.theta = np.linalg.pinv(BtB + self.lambda_param * DtD) @ Bty
+                A_inv = np.linalg.pinv(A)
             except Exception as e:
                 warnings.warn(f"Échec de calibration: {e}")
                 return False
-                
+        self.theta = A_inv @ Bty
+
         self.is_calibrated = True
-        
+
         # Diagnostics
         fitted_y = B @ self.theta
         residuals = self.rates_clean - fitted_y
         self.rmse = np.sqrt(np.mean(residuals**2))
         self.mae = np.mean(np.abs(residuals))
+        # Leave-one-out exact du lisseur linéaire ŷ = H y : e_i / (1 - h_ii), sans refit
+        h = np.einsum('ij,jk,ik->i', B, A_inv, B)
+        self.loo_residuals = residuals / (1 - h)
+        self.loo_rmse = np.sqrt(np.mean(self.loo_residuals**2))
         
         return True
         

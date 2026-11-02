@@ -10,6 +10,8 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.data_io import read_opportunities, read_market_data, read_fitted_curves, OPPORTUNITIES_DIR
 from src.charts import plot_combined_trade_analysis, plot_rv_network, plot_backtest_analysis
 from src.trade_definitions import build_rv_graph
+from src.config import METRIC_TO_BPS, get_repo_spreads
+from src.opportunity_generation import apply_repo_spreads
 from src.exports import generate_markdown_report, convert_df_to_csv
 
 st.set_page_config(page_title="Trade Explorer", page_icon="🕵️", layout="wide")
@@ -46,7 +48,7 @@ with col1:
 def get_opps(date_str):
     return read_opportunities(date_str)
 
-df_opps = get_opps(selected_date)
+df_opps = apply_repo_spreads(get_opps(selected_date), get_repo_spreads())  # hors cache : suit la page Paramètres
 
 if df_opps.empty:
     st.info("Pas d'opportunités à cette date.")
@@ -76,7 +78,7 @@ st.subheader("Fiche de Décision")
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Recommandation", str(trade.get('recommended_direction', 'N/A')).replace('_', ' ').title())
 m2.metric("Spread Actuel", f"{trade.get('spread_market_bps', 0):.1f} bps")
-m3.metric("Cible P-Spline", f"{trade.get('spread_target_bps', 0):.1f} bps", f"{trade.get('target_gap_bps', 0):.1f} bps")
+m3.metric("Cible (courbe + moyenne)", f"{trade.get('spread_target_bps', 0):.1f} bps", f"{trade.get('target_gap_bps', 0):.1f} bps")
 m4.metric("Score RV", f"{trade.get('confidence_score', 0):.0f} / 100")
 
 m5, m6, m7, m8 = st.columns(4)
@@ -106,9 +108,12 @@ st.subheader("Visualisations")
 # Reconstruction de l'historique
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_trade_history(issuer, isins, weights, as_of_date, metric):
-    df_m = read_market_data(issuer)
-    df_f = read_fitted_curves(issuer)
+    # Trade inter-courbes : l'émetteur est de la forme "cades_oat"
+    issuers = issuer.split('_')
+    df_m = pd.concat([read_market_data(i) for i in issuers], ignore_index=True)
+    df_f = pd.concat([read_fitted_curves(i) for i in issuers], ignore_index=True)
     
+    scale = METRIC_TO_BPS[metric]  # le YTM est en %, les graphiques sont en bps
     df_m = df_m[df_m['date'] <= pd.to_datetime(as_of_date)]
     df_f = df_f[df_f['date'] <= pd.to_datetime(as_of_date)]
     
@@ -120,8 +125,8 @@ def get_trade_history(issuer, isins, weights, as_of_date, metric):
         d_f = df_f[df_f['date'] == dt].set_index('isin')
         
         try:
-            m_val = sum(w * d_m.loc[isin, metric] for w, isin in zip(weights, isins))
-            f_val = sum(w * d_f.loc[isin, f"{metric}_fitted"] for w, isin in zip(weights, isins))
+            m_val = scale * sum(w * d_m.loc[isin, metric] for w, isin in zip(weights, isins))
+            f_val = scale * sum(w * d_f.loc[isin, f"{metric}_fitted"] for w, isin in zip(weights, isins))
             history.append({'date': dt, 'spread_market': float(m_val), 'spread_fitted': float(f_val)})
         except Exception:
             pass
@@ -132,7 +137,7 @@ def get_trade_history(issuer, isins, weights, as_of_date, metric):
         
     # --- Calcul du Neighborhood Momentum Historique ---
     try:
-        pivot_m = df_m.pivot(index='date', columns='isin', values=metric)
+        pivot_m = scale * df_m.pivot(index='date', columns='isin', values=metric)
         from src.momentum import compute_ewmac_series
         all_neighbor_mom = []
         trade_isins = set(isins)
@@ -190,16 +195,18 @@ if not df_hist.empty:
     with st.spinner("Génération du backtest..."):
         try:
             import ast
-            mom_str = trade.get('momentum_series', '[]')
+            mom_raw = trade.get('momentum_series', '[]')
+            mom_series = []
             try:
-                if pd.notna(mom_str):
+                if isinstance(mom_raw, (list, np.ndarray)):
+                    mom_series = list(mom_raw)
+                elif pd.notna(mom_raw) and str(mom_raw).strip():
                     # Remplacement de 'nan' par 'None' pour que literal_eval le parse correctement
-                    mom_str = str(mom_str).replace('nan', 'None')
+                    mom_str = str(mom_raw).replace('nan', 'None').replace('NaN', 'None')
                     mom_series = ast.literal_eval(mom_str)
                 else:
                     mom_series = []
             except Exception as e:
-                st.warning(f"Warning parsing momentum: {e}")
                 mom_series = []
                 
             fig_backtest = plot_backtest_analysis(df_hist, 'spread_market', mom_series)
@@ -230,7 +237,7 @@ with st.spinner('Construction du graphe...'):
     base_iss = trade_issuer.split('_')[0] if '_' in trade_issuer else trade_issuer
     allowed_issuers = get_cluster_issuers(base_iss)
     
-    df_spreads = df_opps[(df_opps['trade_type'] == 'spread') & (df_opps['issuer'].isin(allowed_issuers))]
+    df_spreads = df_opps[(df_opps['trade_type'] == 'spread') & (df_opps['issuer'].isin(allowed_issuers)) & (df_opps['metric'] == trade['metric'])]
     
     if not df_spreads.empty:
         fig_net = get_network_fig(df_spreads)

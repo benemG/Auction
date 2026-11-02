@@ -43,6 +43,8 @@ def validate_and_clean_market_data(df: pd.DataFrame) -> pd.DataFrame:
         mask = df['asset_swap_spread'].abs() < 0.5
         if mask.mean() > 0.9:  # 90% des observations sont très petites -> décimal
             df.loc[mask, 'asset_swap_spread'] *= 10000.0
+        # Aberrations Bloomberg (ex. 3.6e8 bps) ; les ASW de crise restent sous 2000 bps
+        df.loc[df['asset_swap_spread'].abs() > 2000, 'asset_swap_spread'] = np.nan
 
     if 'z_spread' in df.columns:
         mask = df['z_spread'].abs() < 0.5

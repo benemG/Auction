@@ -117,11 +117,11 @@ def plot_pspline_curve(df_day: pd.DataFrame, metric: str = 'ytm'):
     df_sorted = df_day.sort_values('ttm_years').copy()
     df_sorted['residual'] = df_sorted[m_col] - df_sorted[f_col]
     
-    # Courbe fittée
+    # Valeurs ajustées leave-one-out : des points, une ligne les relierait en dents de scie
     fig.add_trace(go.Scatter(
         x=df_sorted['ttm_years'], y=df_sorted[f_col],
-        mode='lines', name='P-Spline Fit',
-        line=dict(color='red')
+        mode='markers', name='Fair value (LOO)',
+        marker=dict(color='red', symbol='x', size=7)
     ))
     
     # Points marché colorés selon residual
@@ -461,7 +461,7 @@ def plot_backtest_analysis(df: pd.DataFrame, spread_col: str, precalc_momentum: 
     df = df.copy().sort_values('date').reset_index(drop=True)
     
     # Remplir les petits trous éventuels pour éviter les gaps dans la MA
-    df[spread_col] = df[spread_col].astype(float).ffill()
+    df[spread_col] = pd.to_numeric(df[spread_col], errors='coerce').ffill().bfill()
     spread = df[spread_col]
     
     window_ma = 60
@@ -476,13 +476,14 @@ def plot_backtest_analysis(df: pd.DataFrame, spread_col: str, precalc_momentum: 
     df['Z_Score'] = Z_Score
     
     # --- Utilisation du Momentum pré-calculé ---
-    if precalc_momentum and len(precalc_momentum) > 0:
+    momentum = pd.Series(np.nan, index=df.index, dtype=float)
+    if precalc_momentum is not None and len(precalc_momentum) > 0:
         # Align from the end in case history is longer
-        momentum = pd.Series(np.nan, index=df.index)
-        usable_len = min(len(precalc_momentum), len(momentum))
-        momentum.iloc[-usable_len:] = precalc_momentum[-usable_len:]
-    else:
-        momentum = pd.Series(np.nan, index=df.index)
+        # Conversion sécurisée en float64 avec conversion de None / NaN / chaînes invalides vers np.nan
+        clean_mom = pd.to_numeric(pd.Series(precalc_momentum), errors='coerce').to_numpy()
+        usable_len = min(len(clean_mom), len(momentum))
+        if usable_len > 0:
+            momentum.iloc[-usable_len:] = clean_mom[-usable_len:]
         
     df['Momentum'] = momentum
     
@@ -553,7 +554,12 @@ def plot_backtest_analysis(df: pd.DataFrame, spread_col: str, precalc_momentum: 
     if filtered:
         f_dates = [f['date'] for f in filtered]
         f_spreads = [f['spread'] for f in filtered]
-        f_texts = [f"<b>Filtered {f['direction']}</b><br>Z-Score: {f['zscore']:.2f}<br>Hurst: {f['hurst']:.2f}<br>ADF: {f['adf']:.3f}" for f in filtered]
+        f_texts = []
+        for f in filtered:
+            z_s = f"{f['zscore']:.2f}" if pd.notna(f.get('zscore')) else "N/A"
+            h_s = f"{f['hurst']:.2f}" if pd.notna(f.get('hurst')) else "N/A"
+            a_s = f"{f['adf']:.3f}" if pd.notna(f.get('adf')) else "N/A"
+            f_texts.append(f"<b>Filtered {f.get('direction', '')}</b><br>Z-Score: {z_s}<br>Hurst: {h_s}<br>ADF: {a_s}")
         fig.add_trace(go.Scatter(
             x=f_dates, y=f_spreads,
             mode='markers', marker=dict(color='gray', symbol='circle', size=6, opacity=0.6),
@@ -564,12 +570,17 @@ def plot_backtest_analysis(df: pd.DataFrame, spread_col: str, precalc_momentum: 
     for e in entries:
         color = 'green' if e['direction'] == 'Long' else 'red'
         symbol = 'triangle-up' if e['direction'] == 'Long' else 'triangle-down'
+        date_str = e['date'].strftime('%Y-%m-%d') if hasattr(e['date'], 'strftime') else str(e['date'])
+        sp_str = f"{e['spread']:.2f}" if pd.notna(e.get('spread')) else "N/A"
+        z_str = f"{e['zscore']:.2f}" if pd.notna(e.get('zscore')) else "N/A"
+        h_str = f"{e['hurst']:.2f}" if pd.notna(e.get('hurst')) else "N/A"
+        a_str = f"{e['adf']:.3f}" if pd.notna(e.get('adf')) else "N/A"
         hover_text = (f"<b>{e['direction']} Spread</b><br>"
-                      f"Date: {e['date'].strftime('%Y-%m-%d')}<br>"
-                      f"Spread: {e['spread']:.2f} bps<br>"
-                      f"Z-Score: {e['zscore']:.2f}<br>"
-                      f"Hurst (252j): {e['hurst']:.2f}<br>"
-                      f"ADF p-val: {e['adf']:.3f}")
+                      f"Date: {date_str}<br>"
+                      f"Spread: {sp_str} bps<br>"
+                      f"Z-Score: {z_str}<br>"
+                      f"Hurst (252j): {h_str}<br>"
+                      f"ADF p-val: {a_str}")
                       
         fig.add_trace(go.Scatter(
             x=[e['date']], y=[e['spread']],
@@ -579,10 +590,11 @@ def plot_backtest_analysis(df: pd.DataFrame, spread_col: str, precalc_momentum: 
         
     # Croix de sortie
     for ex in exits:
+        sp_str = f"{ex['spread']:.2f}" if pd.notna(ex.get('spread')) else "N/A"
         fig.add_trace(go.Scatter(
             x=[ex['date']], y=[ex['spread']],
             mode='markers', marker=dict(color='black', symbol='x', size=10),
-            name="Exit", text=[f"Exit at {ex['spread']:.2f} bps"], hoverinfo="text", showlegend=False
+            name="Exit", text=[f"Exit at {sp_str} bps"], hoverinfo="text", showlegend=False
         ), row=1, col=1)
         
     # 2. Momentum

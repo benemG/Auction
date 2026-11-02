@@ -1,8 +1,14 @@
+import shutil
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pathlib import Path
 from .config import MARKET_DATA_DIR, FITTED_CURVES_DIR, OPPORTUNITIES_DIR
+
+def _clear_issuers(root, df):
+    # Écriture = réécriture complète par émetteur : on supprime aussi les années devenues absentes
+    for issuer in df['issuer'].unique():
+        shutil.rmtree(root / f"issuer={issuer}", ignore_errors=True)
 
 def write_market_data(df: pd.DataFrame):
     """
@@ -15,13 +21,13 @@ def write_market_data(df: pd.DataFrame):
     df['year'] = df['date'].dt.year
     
     table = pa.Table.from_pandas(df)
+    _clear_issuers(MARKET_DATA_DIR, df)
     
     pq.write_to_dataset(
         table,
         root_path=str(MARKET_DATA_DIR),
         partition_cols=['issuer', 'year'],
-        compression='zstd',
-        existing_data_behavior='overwrite_or_ignore'
+        compression='zstd'
     )
 
 def read_market_data(issuer: str, min_date: str = None) -> pd.DataFrame:
@@ -57,6 +63,7 @@ def write_fitted_curves(df: pd.DataFrame):
     df['year'] = df['date'].dt.year
     
     table = pa.Table.from_pandas(df)
+    _clear_issuers(FITTED_CURVES_DIR, df)
     
     pq.write_to_dataset(
         table,
@@ -88,8 +95,6 @@ def read_fitted_curves(issuer: str, min_date: str = None) -> pd.DataFrame:
     df = df.drop_duplicates(subset=['date', 'isin'], keep='last')
         
     return df.sort_values(['date', 'isin']).reset_index(drop=True)
-
-import shutil
 
 def write_opportunities(df: pd.DataFrame, as_of_date: pd.Timestamp):
     """

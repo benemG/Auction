@@ -1,9 +1,28 @@
 import pytest
 import sys
+import numpy as np
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from src.hedge_ratio import compute_spread_hedge_ratio, compute_fly_hedge_ratio, compute_residual_dv01
+from src.hedge_ratio import (compute_spread_hedge_ratio, compute_fly_hedge_ratio, compute_residual_dv01,
+                             parse_coupon, approx_modified_duration)
+
+def test_parse_coupon_formats():
+    assert parse_coupon("BTPS 2 1/2 11/15/25") == 2.5
+    assert parse_coupon("BTPS 2.85 02/01/31") == 2.85
+    assert parse_coupon("AGFRNC 0 1/8 04/30/22") == 0.125
+    assert parse_coupon("RATB 0 04/19/21") == 0.0
+    assert np.isnan(parse_coupon("FRTR Float 12/13/97"))
+
+def test_approx_modified_duration():
+    # Zéro-coupon : D_mac = T
+    assert approx_modified_duration(3.0, 0.0, 7.0) == pytest.approx(7.0 / 1.03)
+    # 5 ans au pair à 3 % : D_mac = 4.717, D_mod = 4.580
+    assert approx_modified_duration(3.0, 3.0, 5.0) == pytest.approx(4.580, abs=1e-3)
+    assert np.isnan(approx_modified_duration(3.0, np.nan, 5.0))
+
+def test_residual_dv01_nan_if_missing():
+    assert np.isnan(compute_residual_dv01([1.0, -1.0], [5.0, np.nan]))
 
 def test_spread_hedge_ratio():
     n1, n2 = compute_spread_hedge_ratio(dv01_a=5.0, dv01_b=10.0)

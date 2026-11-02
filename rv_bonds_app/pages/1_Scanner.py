@@ -8,7 +8,8 @@ import itertools
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from src.data_io import read_opportunities, OPPORTUNITIES_DIR
-from src.config import MARKET_DATA_DIR, MIN_Z_SCORE_ENTRY
+from src.config import MARKET_DATA_DIR, MIN_Z_SCORE_ENTRY, get_repo_spreads
+from src.opportunity_generation import apply_repo_spreads
 
 METRIC_LABELS = {'asset_swap_spread': 'ASW', 'ytm': 'YTM'}
 
@@ -45,8 +46,12 @@ with col1:
         st.rerun()
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_data(date_str):
+def _read(date_str):
     return read_opportunities(date_str)
+
+def load_data(date_str):
+    # Spread de repo appliqué hors cache, à l'affichage seulement : suit la page Paramètres sans batch
+    return apply_repo_spreads(_read(date_str), get_repo_spreads())
 
 df = load_data(selected_date)
 
