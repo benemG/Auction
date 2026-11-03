@@ -1,5 +1,7 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+import ast
 import sys
 import json
 from pathlib import Path
@@ -83,6 +85,27 @@ if selected_issuer != 'Tous':
     allowed_issuers = get_cluster_issuers(selected_issuer)
     df_filtered = df_filtered[df_filtered['issuer'].isin(allowed_issuers)]
 
+# --- Recherche des trades d'un titre, avec le sens de sa jambe ---
+LEG_COLS = ['bond1_isin', 'bond2_isin', 'bond3_isin']
+legs = pd.concat([df_filtered[[f'bond{k}_isin', f'bond{k}_name']].set_axis(['isin', 'name'], axis=1) for k in (1, 2, 3)])
+names = dict(legs.dropna().drop_duplicates('isin').values)
+c_isin, c_side = st.columns([3, 1], vertical_alignment='bottom')
+search_isin = c_isin.selectbox("Rechercher les trades d'un titre", sorted(names, key=names.get), index=None,
+                               format_func=lambda i: f"{names[i]} · {i}", placeholder="Nom ou ISIN du titre")
+side = c_side.segmented_control("Position", ['Long', 'Short'], disabled=search_isin is None,
+                                help="Position sur le titre recherché ; aucun choix : les deux sens")
+
+def isin_side(r):
+    """Position sur le titre = -sens du spread × poids de sa jambe (achat du spread = vente de la jambe de poids +1)."""
+    w = ast.literal_eval(r.leg_weights)[[r.bond1_isin, r.bond2_isin, r.bond3_isin].index(search_isin)]
+    return 'Long' if -np.sign(r.target_gap_bps) * w > 0 else 'Short'
+
+if search_isin:
+    df_filtered = df_filtered[df_filtered[LEG_COLS].eq(search_isin).any(axis=1)]
+    df_filtered = df_filtered.assign(isin_side=[isin_side(r) for r in df_filtered.itertuples()])
+    if side:
+        df_filtered = df_filtered[df_filtered['isin_side'] == side]
+
 st.sidebar.header("Filtres")
 trade_types = st.sidebar.multiselect("Type de Trade", df['trade_type'].unique(), default=df['trade_type'].unique())
 metrics = st.sidebar.multiselect("Mesure", df['metric'].unique(), default=df['metric'].unique(), format_func=lambda m: METRIC_LABELS.get(m, m))
@@ -103,15 +126,17 @@ if only_entry_zone and 'in_entry_zone' in df_filtered.columns:
 # Tri par défaut par gain net / risque
 df_filtered = df_filtered.sort_values('net_edge_ratio', ascending=False)
 
-# Redondance : un trade est gardé si aucune de ses jambes n'a déjà atteint le maximum
-counts, keep = {}, []
-for legs in df_filtered[['bond1_isin', 'bond2_isin', 'bond3_isin']].itertuples(index=False):
-    legs = [l for l in legs if isinstance(l, str)]
-    keep.append(all(counts.get(l, 0) < max_per_bond for l in legs))
-    if keep[-1]:
-        for l in legs:
-            counts[l] = counts.get(l, 0) + 1
-df_filtered = df_filtered[keep]
+# Redondance : un trade est gardé si aucune de ses jambes n'a déjà atteint le maximum ;
+# ignorée quand on cherche un titre, sinon elle couperait ses trades à max_per_bond
+if search_isin is None:
+    counts, keep = {}, []
+    for legs in df_filtered[LEG_COLS].itertuples(index=False):
+        legs = [l for l in legs if isinstance(l, str)]
+        keep.append(all(counts.get(l, 0) < max_per_bond for l in legs))
+        if keep[-1]:
+            for l in legs:
+                counts[l] = counts.get(l, 0) + 1
+    df_filtered = df_filtered[keep]
 
 # --- Changements vs date précédente (top 20 par gain net, émetteurs communs aux deux dates) ---
 i = dates.index(selected_date)
@@ -134,10 +159,12 @@ with st.expander("Changements vs date précédente", expanded=True):
         c2.dataframe(prev_top.loc[prev_top.index.difference(cur_top.index), cols], use_container_width=True)
 
 st.write(f'### Resultats : {len(df_filtered)} opportunites')
+if search_isin:
+    st.caption(f"Trades contenant {names[search_isin]} : filtres de la barre latérale appliqués, plafond par titre ignoré.")
 
 # Configuration des colonnes pour un affichage compact
 display_cols = [
-    'trade_id', 'metric', 'issuer', 'recommended_direction', 'net_edge_ratio', 'confidence_score', 'zscore_12m',
+    'trade_id', 'isin_side', 'metric', 'issuer', 'recommended_direction', 'net_edge_ratio', 'confidence_score', 'zscore_12m',
     'expected_gain_bps', 'risk_h_bps', 'net_carry_roll_3m_bps', 'half_life_days',
     'market_share', 'quote_glitches_12m',
     'exit_target_bps', 'stop_loss_bps', 'exit_time_days', 'gain_per_day_bps', 'residual_dv01'
@@ -150,6 +177,7 @@ df_display = df_filtered[available_cols].reset_index(drop=True)
 
 column_config = {
     "trade_id": st.column_config.TextColumn("Trade ID", help="Identifiant unique de l'opportunité"),
+    "isin_side": st.column_config.TextColumn("Position titre", help="Long ou short sur le titre recherché dans ce trade"),
     "metric": st.column_config.TextColumn("Mesure"),
     "issuer": st.column_config.TextColumn("Émetteur"),
     "trade_type": st.column_config.TextColumn("Type"),
