@@ -1,7 +1,5 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import ast
 import sys
 import json
 from pathlib import Path
@@ -12,6 +10,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.data_io import read_opportunities, OPPORTUNITIES_DIR
 from src.config import MARKET_DATA_DIR, MIN_Z_SCORE_ENTRY, METRIC_LABELS, get_repo_spreads
 from src.opportunity_generation import apply_repo_spreads
+from src.trade_definitions import leg_position
 
 
 st.set_page_config(page_title="Scanner", page_icon="🔍", layout="wide")
@@ -95,14 +94,9 @@ search_isin = c_isin.selectbox("Rechercher les trades d'un titre", sorted(names,
 side = c_side.segmented_control("Position", ['Long', 'Short'], disabled=search_isin is None,
                                 help="Position sur le titre recherché ; aucun choix : les deux sens")
 
-def isin_side(r):
-    """Position sur le titre = -sens du spread × poids de sa jambe (achat du spread = vente de la jambe de poids +1)."""
-    w = ast.literal_eval(r.leg_weights)[[r.bond1_isin, r.bond2_isin, r.bond3_isin].index(search_isin)]
-    return 'Long' if -np.sign(r.target_gap_bps) * w > 0 else 'Short'
-
 if search_isin:
     df_filtered = df_filtered[df_filtered[LEG_COLS].eq(search_isin).any(axis=1)]
-    df_filtered = df_filtered.assign(isin_side=[isin_side(r) for r in df_filtered.itertuples()])
+    df_filtered = df_filtered.assign(isin_side=[leg_position(r, search_isin) for _, r in df_filtered.iterrows()])
     if side:
         df_filtered = df_filtered[df_filtered['isin_side'] == side]
 

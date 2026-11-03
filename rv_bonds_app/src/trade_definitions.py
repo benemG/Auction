@@ -245,3 +245,14 @@ def generate_fly_combinations_from_graph(graph: nx.Graph, df_current: pd.DataFra
 # On garde l'ancienne pour compatibilité si nécessaire, mais on l'a désactivée par défaut
 def generate_fly_combinations(df_current: pd.DataFrame, max_wing_diff: float = 3.0) -> list:
     pass # replaced by generate_fly_combinations_from_graph
+
+def leg_position(row, isin: str) -> str:
+    """
+    'Long' ou 'Short' sur le titre `isin` dans le trade `row` (bond1..3_isin, leg_weights, target_gap_bps).
+    Le spread suivi vaut Σ w_i·y_i ; on achète le spread (gap > 0) pour gagner quand il monte, soit une position
+    -sens·w_i sur chaque titre : un titre long gagne quand son rendement baisse. Achat d'un fly = long du belly.
+    """
+    import ast
+    legs = [row['bond1_isin'], row['bond2_isin'], row['bond3_isin']]
+    w = ast.literal_eval(row['leg_weights'])[legs.index(isin)]
+    return 'Long' if -np.sign(row['target_gap_bps']) * w > 0 else 'Short'
