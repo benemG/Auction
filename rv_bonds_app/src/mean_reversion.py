@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
-from scipy.integrate import quad
+from scipy.integrate import quad, trapezoid, cumulative_trapezoid
+from scipy.special import erf, erfi
 import warnings
 
 def compute_hurst_exponent(time_series: pd.Series, max_lag=20) -> float:
@@ -133,6 +134,18 @@ class MeanReversionModel:
         else:
             self.message = "Calibration MLE réussie."
 
+        # Correction de Kendall (1954) du biais de l'AR(1) : sur ~1 an, la demi-vie estimée est trop courte.
+        # var_eps = variance des innovations, identique dans les deux chemins : sigma² (1 - phi²) / (2 theta)
+        phi = np.exp(-theta_hat * dt)
+        var_eps = sigma_hat**2 * (1 - phi**2) / (2 * theta_hat)
+        phi = phi + (1 + 3 * phi) / N
+        if phi >= 1.0:
+            self.status = "failed"
+            self.message = "Pas de retour à la moyenne après correction du biais (racine unitaire)."
+            return self._return_state()
+        theta_hat = -np.log(phi) / dt
+        sigma_hat = np.sqrt(var_eps * 2 * theta_hat / (1 - phi**2))
+
         # Sauvegarde de l'état
         self.theta = theta_hat
         self.mu = mu_hat
@@ -200,20 +213,23 @@ class MeanReversionModel:
             
             return term1 * np.exp(exponent)
             
+        # Borne en temps réduit theta·t <= 50 (queue en e^-theta·t) : avec [0, 1000] ans, quad ratait le pic des
+        # demi-vies courtes (quelques jours) et renvoyait ~0
+        t_max = 50.0 / self.theta
         try:
             # Intégrale pour E[T]
             res_T, err_T = quad(
-                lambda t: t * self.theta * _density_T_to_theta(self.theta * t, C), 
-                0, 
-                1000,
+                lambda t: t * self.theta * _density_T_to_theta(self.theta * t, C),
+                0,
+                t_max,
                 limit=100
             )
-            
+
             # Intégrale pour Var(T)
             res_var, err_var = quad(
-                lambda t: ((t - res_T)**2) * self.theta * _density_T_to_theta(self.theta * t, C), 
-                0, 
-                1000,
+                lambda t: ((t - res_T)**2) * self.theta * _density_T_to_theta(self.theta * t, C),
+                0,
+                t_max,
                 limit=100
             )
             
@@ -227,6 +243,68 @@ class MeanReversionModel:
             }
         except Exception as e:
             return {"expected_time": np.nan, "standard_deviation": np.nan, "status": f"failed: {e}"}
+
+def horizon_risk(ts: pd.Series, h: int, halflife: float, window: int = 252) -> float:
+    """
+    Écart-type des variations à h jours de `ts` : vol quotidienne EWM × √(h · VR_h), où VR_h = var(Δ_h) / (h · var(Δ_1))
+    est le ratio de variance (Lo-MacKinlay) sur `window` jours. La vol suit le régime récent, la forme de retour à la
+    moyenne vient de la fenêtre longue (une EWM des Δ_h qui se chevauchent n'aurait que 2-3 fenêtres indépendantes).
+    """
+    ts = ts.dropna()
+    if len(ts) < h + 30:
+        return np.nan
+    tail = ts.tail(window)
+    # Moments non centrés (dérive ~0) : centrer les Δ_h qui se chevauchent sous-estime la variance de ~h/window
+    var1 = (tail.diff() ** 2).mean()
+    if not var1 > 0:
+        return np.nan
+    vr = (tail.diff(h) ** 2).mean() / (h * var1)
+    vol_ewm = np.sqrt((ts.diff() ** 2).ewm(halflife=halflife).mean().iloc[-1])
+    return float(vol_ewm * np.sqrt(h * vr))
+
+# --- Seuils optimaux pour Y, OU de moyenne 0 (dY = -theta Y dt + sigma dW), position gagnante quand Y monte ---
+# En unités u = y·√theta/sigma, la fonction d'échelle de l'OU est ∝ erfi(u) : tout est vectorisé, sans quad par trade.
+
+def bertram_entry_band(theta: float, sigma: float, cost: float) -> float:
+    """Demi-largeur m* de la bande symétrique autour de la moyenne qui maximise (2m - cost) / E[cycle] (Bertram 2010)."""
+    m = np.linspace(0.05, 3.0, 300) * sigma / np.sqrt(2 * theta)
+    cycle = 2 * np.pi / theta * erfi(m * np.sqrt(theta) / sigma)
+    return float(m[np.argmax((2 * m - cost) / cycle)])
+
+def leung_li_exit(y0: float, theta: float, sigma: float, cost: float, stop_sd: float):
+    """
+    Sortie optimale b* (take-profit) avec stop-loss L = y0 - stop_sd·s (Leung & Li 2015), s = écart-type stationnaire.
+    V(b) = L - cost + (b - L)·P(b avant L), P venant de la fonction d'échelle.
+    shortcut: actualisation r = 0 (limite de leurs fonctions F/G) : à l'ESTER sur quelques semaines l'écart est < 0,01 bp ;
+    passer à F/G si les horizons s'allongent.
+    Retourne (b*, L, gain attendu net V(b*) - y0, P(b* avant L)) ; NaN si les erfi débordent (écart extrême).
+    """
+    s = sigma / np.sqrt(2 * theta)
+    k = np.sqrt(theta) / sigma
+    L = y0 - stop_sd * s
+    b = np.linspace(y0, max(3 * s, y0 + s), 301)[1:]
+    with np.errstate(over='ignore', invalid='ignore'):
+        p = (erfi(k * y0) - erfi(k * L)) / (erfi(k * b) - erfi(k * L))
+    value = L - cost + (b - L) * p
+    if not np.isfinite(value).any():
+        return np.nan, L, np.nan, np.nan
+    i = np.nanargmax(value)
+    return float(b[i]), float(L), float(value[i] - y0), float(p[i])
+
+def ou_exit_time(y0: float, lo: float, hi: float, theta: float, sigma: float, n: int = 2001) -> float:
+    """
+    Temps moyen (en années) avant que Y sorte de ]lo, hi[ en partant de y0 : (sigma²/2) f'' - theta y f' = -1,
+    f(lo) = f(hi) = 0. En u : f' = e^{u²} (C - √π/theta · erf u), C fixé par f(hi) = 0.
+    """
+    k = np.sqrt(theta) / sigma
+    w = np.linspace(lo * k, hi * k, n)
+    with np.errstate(over='ignore'):
+        e = np.exp(w**2)
+    if not np.isfinite(e).all():
+        return np.nan
+    c = np.sqrt(np.pi) / theta * trapezoid(e * erf(w), w) / trapezoid(e, w)
+    f = cumulative_trapezoid(e * (c - np.sqrt(np.pi) / theta * erf(w)), w, initial=0)
+    return float(np.interp(y0 * k, w, f))
 
 from statsmodels.tsa.stattools import adfuller
 

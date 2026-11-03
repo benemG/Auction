@@ -90,14 +90,29 @@ metrics = st.sidebar.multiselect("Mesure", df['metric'].unique(), default=df['me
 min_score = st.sidebar.slider("Score de Confiance Minimum", 0, 100, 50)
 min_z = st.sidebar.slider("|Z-Score 12M| Minimum", 0.0, 4.0, float(MIN_Z_SCORE_ENTRY), 0.5)
 only_valid_ou = st.sidebar.checkbox("Uniquement OU valide", value=False)
+only_entry_zone = st.sidebar.checkbox("Au-delà du seuil d'entrée optimal (Bertram)", value=False)
+max_per_bond = st.sidebar.slider("Trades max par titre", 1, 10, 2,
+                                 help="Évite que le même titre cher/riche remplisse le tableau : sélection par gain net / risque décroissant")
 
 df_filtered = df_filtered[df_filtered['trade_type'].isin(trade_types) & df_filtered['metric'].isin(metrics)]
 df_filtered = df_filtered[(df_filtered['confidence_score'] >= min_score) & (df_filtered['zscore_12m'].abs() >= min_z)]
 if only_valid_ou:
     df_filtered = df_filtered[df_filtered['ou_calibration_status'] == 'valid']
+if only_entry_zone and 'in_entry_zone' in df_filtered.columns:
+    df_filtered = df_filtered[df_filtered['in_entry_zone'].fillna(False).astype(bool)]
 
 # Tri par défaut par gain net / risque
 df_filtered = df_filtered.sort_values('net_edge_ratio', ascending=False)
+
+# Redondance : un trade est gardé si aucune de ses jambes n'a déjà atteint le maximum
+counts, keep = {}, []
+for legs in df_filtered[['bond1_isin', 'bond2_isin', 'bond3_isin']].itertuples(index=False):
+    legs = [l for l in legs if isinstance(l, str)]
+    keep.append(all(counts.get(l, 0) < max_per_bond for l in legs))
+    if keep[-1]:
+        for l in legs:
+            counts[l] = counts.get(l, 0) + 1
+df_filtered = df_filtered[keep]
 
 # --- Changements vs date précédente (top 20 par gain net, émetteurs communs aux deux dates) ---
 i = dates.index(selected_date)
@@ -124,7 +139,8 @@ st.write(f'### Resultats : {len(df_filtered)} opportunites')
 # Configuration des colonnes pour un affichage compact
 display_cols = [
     'trade_id', 'metric', 'issuer', 'recommended_direction', 'net_edge_ratio', 'confidence_score', 'zscore_12m',
-    'carry_roll_adjusted_gap', 'half_life_days', 'net_carry_roll_3m_bps', 'residual_dv01'
+    'expected_gain_bps', 'risk_h_bps', 'net_carry_roll_3m_bps', 'half_life_days',
+    'exit_target_bps', 'stop_loss_bps', 'exit_time_days', 'gain_per_day_bps', 'residual_dv01'
 ]
 
 # We might not have 'zscore_3m' or 'carry_roll_adjusted_gap' in older datasets, so we check
@@ -138,7 +154,13 @@ column_config = {
     "issuer": st.column_config.TextColumn("Émetteur"),
     "trade_type": st.column_config.TextColumn("Type"),
     "recommended_direction": st.column_config.TextColumn("Direction"),
-    "net_edge_ratio": st.column_config.NumberColumn("Gain net / σ", help="(écart + carry/roll - coûts) / écart-type 12M du spread ; trié par défaut", format="%.2f"),
+    "net_edge_ratio": st.column_config.NumberColumn("Gain net / risque 3M", help="(gain attendu 3M + carry/roll - coûts) / risque 3M du spread de marché ; trié par défaut", format="%.2f"),
+    "expected_gain_bps": st.column_config.NumberColumn("Gain attendu 3M (bps)", help="|écart| × (1 - e^(-θ·3M)), demi-vie corrigée du biais", format="%.2f"),
+    "risk_h_bps": st.column_config.NumberColumn("Risque 3M (bps)", help="Écart-type des variations à 3M du spread de marché (vol EWM × ratio de variance)", format="%.2f"),
+    "exit_target_bps": st.column_config.NumberColumn("Objectif (bps)", help="Mouvement visé jusqu'à la sortie optimale Leung-Li", format="%.2f"),
+    "stop_loss_bps": st.column_config.NumberColumn("Stop (bps)", help="Mouvement adverse avant stop-loss", format="%.2f"),
+    "exit_time_days": st.column_config.NumberColumn("Durée attendue (j)", help="Temps moyen avant objectif ou stop (premier passage OU)", format="%.0f"),
+    "gain_per_day_bps": st.column_config.NumberColumn("Gain / jour (bps)", help="Gain attendu Leung-Li / durée attendue", format="%.3f"),
     "confidence_score": st.column_config.ProgressColumn(
         "Score RV",
         help="Score de confiance composite (0 à 100)",

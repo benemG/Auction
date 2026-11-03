@@ -47,3 +47,12 @@ def test_dv01_is_approximated_and_weights_are_parseable():
     assert nominals[0] == 1.0 and -1.7 < nominals[1] < -1.5  # DV01 5 ans / DV01 3 ans ≈ 1.6
     assert abs(row['residual_dv01']) < 1e-9
     assert ast.literal_eval(row['leg_weights']) == [1.0, -1.0]
+
+def test_expected_gain_and_ratio_definition():
+    market, fitted, last = _data()
+    trade = [dict(trade_id='SPD | A / B', trade_type='spread', bond1_isin='A', bond2_isin='B', bond3_isin=None,
+                  bond1_name='A', bond2_name='B', bond3_name=None, ttm_a=5.0, ttm_b=3.0)]
+    row = generate_opportunities_for_issuer(market, fitted, trade, last, 'asset_swap_spread').iloc[0]
+    assert row['expected_gain_bps'] <= abs(row['target_gap_bps']) + 1e-12
+    net_edge = row['expected_gain_bps'] + row['net_carry_roll_3m_bps'] - row['bid_ask_cost_bps']
+    assert row['net_edge_ratio'] == np.float64(net_edge / row['risk_h_bps'])

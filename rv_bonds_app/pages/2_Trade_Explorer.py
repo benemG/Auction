@@ -94,6 +94,18 @@ m11.metric("Exp. First Hitting", f"{trade.get('first_hitting_time_days', 0):.0f}
 m12.metric("DV01 Résiduelle", f"{trade.get('residual_dv01', 0):.4f}")
 m13.metric("Cointégration (p-val)", f"{trade.get('adf_pvalue', np.nan):.3f}")
 
+# Signal et risque à 3M, seuils optimaux (Bertram / Leung-Li) ; NaN sur les parquets antérieurs au P1
+g = lambda k: trade.get(k, np.nan)
+m14, m15, m16, m17, m18, m19 = st.columns(6)
+m14.metric("Gain / risque 3M", f"{g('expected_gain_bps'):.1f} / {g('risk_h_bps'):.1f} bps")
+in_zone = g('in_entry_zone') == True  # np.bool_ depuis le Parquet, NaN sur les anciens fichiers
+m15.metric("Seuil d'entrée (Bertram)", f"{g('entry_band_bps'):.1f} bps", "dans la zone" if in_zone else "hors zone",
+           delta_color="normal" if in_zone else "off")
+m16.metric("Objectif / Stop", f"+{g('exit_target_bps'):.1f} / -{g('stop_loss_bps'):.1f} bps")
+m17.metric("P(objectif avant stop)", f"{g('prob_target'):.0%}")
+m18.metric("Durée attendue", f"{g('exit_time_days'):.0f} j")
+m19.metric("Gain Leung-Li", f"{g('ll_expected_gain_bps'):.1f} bps", f"{g('gain_per_day_bps'):.2f} bps/j", delta_color="off")
+
 # Exporter
 st.download_button(
     label="Exporter la fiche (Markdown)",

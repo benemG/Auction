@@ -71,6 +71,11 @@ PSPLINE_DEFAULT_LAMBDA = 1.0
 # --- OU MODEL PARAMS ---
 OU_DEFAULT_DT = 1.0 / TRADING_DAYS_IN_YEAR
 
+# --- SIGNAL ET RISQUE (P1) ---
+HOLDING_HORIZON_DAYS = 63     # horizon du gain attendu et du risque, aligné sur le carry/roll 3M
+RISK_EWM_HALFLIFE_DAYS = 21   # demi-vie de l'EWM de la vol quotidienne du spread de marché
+STOP_LOSS_SD = 1.0            # stop-loss Leung-Li : écarts-types stationnaires au-delà du point d'entrée
+
 # --- SCORING WEIGHTS ---
 SCORE_WEIGHTS = {
     'cointegration': 0.2,

@@ -19,7 +19,11 @@ def test_apply_repo_spreads_adjusts_by_leg_sensitivity():
     adj = 0.05 * -10.0 + -0.025 * 4.0  # -0.6 bp
     assert out['net_carry_roll_3m_bps'].iloc[0] == 1.0 + adj
     assert out['carry_roll_adjusted_gap'].iloc[0] == 3.0 + adj
-    assert out['net_edge_ratio'].iloc[0] == 1.5 + adj / 2.0
+    assert out['net_edge_ratio'].iloc[0] == 1.5 + adj / 2.0  # sans risk_h_bps : repli sur daily_vol_bps
+
+def test_apply_repo_spreads_uses_horizon_risk():
+    out = apply_repo_spreads(_df().assign(risk_h_bps=4.0), {'bund': -10.0, 'default': 4.0})
+    assert out['net_edge_ratio'].iloc[0] == 1.5 + (0.05 * -10.0 + -0.025 * 4.0) / 4.0
 
 def test_apply_repo_spreads_noop_without_columns_or_spreads():
     df = _df()

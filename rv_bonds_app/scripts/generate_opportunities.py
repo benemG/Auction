@@ -1,12 +1,13 @@
 import sys
 import os
 import itertools
+import shutil
 from pathlib import Path
 import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from src.config import (MARKET_DATA_DIR, FITTED_CURVES_DIR, MAX_FLY_WING_SPREAD_YEARS, METRIC_TO_BPS,
+from src.config import (MARKET_DATA_DIR, FITTED_CURVES_DIR, OPPORTUNITIES_DIR, MAX_FLY_WING_SPREAD_YEARS, METRIC_TO_BPS,
                         COINTEGRATION_FILTER_ENABLED, MICRO_RV_N_CLUSTERS)
 from src.data_io import read_market_data, read_fitted_curves, write_opportunities
 from src.trade_definitions import (generate_spread_combinations, build_rv_graph, generate_fly_combinations_from_graph,
@@ -101,7 +102,11 @@ def generate_opportunities():
     cluster_file = MARKET_DATA_DIR.parent / "clusters.json"
     with open(cluster_file, "w") as f:
         json.dump(clusters, f)
-        
+
+    # Les paires d'un découpage précédent ne seraient pas réécrites et resteraient dans le Scanner
+    for part in (OPPORTUNITIES_DIR / f"date_str={global_last_date:%Y-%m-%d}").glob('issuer=*_*'):
+        shutil.rmtree(part)
+
     for cluster in clusters:
         # Garder seulement les émetteurs qu'on a pu charger
         cluster = [iss for iss in cluster if iss in current_dict]

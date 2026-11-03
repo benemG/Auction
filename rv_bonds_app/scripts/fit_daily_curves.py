@@ -12,6 +12,16 @@ from src.pspline_curve import PSplineCurveFitter
 
 LAMBDA_GRID = [0.01, 0.1, 1, 10, 100]
 
+TEMP_LINE_MAX_DAYS = 60  # une ligne d'abondement temporaire est assimilée en ~40 jours
+
+def exclude_off_curve(df):
+    """Titres hors courbe : retail belge (BGBRT, fiscalité propre) et lignes d'abondement temporaires
+    (même nom qu'une ligne plus ancienne, < TEMP_LINE_MAX_DAYS cotations). Les jumeaux verts sont gardés."""
+    n = df.groupby('isin')['date'].transform('size')
+    temp = (df.duplicated(['date', 'bond_name'], keep=False) & (n < TEMP_LINE_MAX_DAYS)
+            & (n < n.groupby([df['date'], df['bond_name']]).transform('max')))
+    return df[~df['bond_name'].str.startswith('BGBRT') & ~temp]
+
 def day_universe(df, dt):
     """Titres du fit du jour : maturité >= 1 an, hors indexées inflation."""
     df_day = df[df['date'] == dt].copy()
@@ -54,8 +64,8 @@ def fit_daily_curves():
 
     for issuer in issuers:
         print(f"\nTraitement de l'émetteur : {issuer}")
-        df = read_market_data(issuer)
-        
+        df = exclude_off_curve(read_market_data(issuer))
+
         if df.empty:
             continue
             

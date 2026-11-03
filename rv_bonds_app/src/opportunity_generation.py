@@ -4,9 +4,11 @@ import numpy as np
 from .hedge_ratio import (compute_spread_hedge_ratio, compute_fly_hedge_ratio, compute_residual_dv01,
                           parse_coupon, approx_modified_duration)
 from .momentum import compute_ewmac, compute_ewmac_series
-from .mean_reversion import MeanReversionModel, compute_hurst_exponent, compute_adf_pvalue
+from .mean_reversion import (MeanReversionModel, compute_hurst_exponent, compute_adf_pvalue, horizon_risk,
+                             bertram_entry_band, leung_li_exit, ou_exit_time)
 from .scoring import calculate_confidence_score
-from .config import TRADING_DAYS_IN_YEAR, SCORE_WEIGHTS, METRIC_TO_BPS
+from .config import (TRADING_DAYS_IN_YEAR, SCORE_WEIGHTS, METRIC_TO_BPS, HOLDING_HORIZON_DAYS,
+                     RISK_EWM_HALFLIFE_DAYS, STOP_LOSS_SD)
 
 def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.DataFrame, trades_def: list, as_of_date: pd.Timestamp, metric: str = 'asset_swap_spread') -> pd.DataFrame:
     """
@@ -96,12 +98,15 @@ def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.Dat
         current_svf = current_spread - current_target
         ts_svf_12m = ts_svf.dropna().tail(252)
 
-        # Calibration OU : une seule cible (moyenne OU, sinon moyenne 12M) pour z-score, gap et direction
+        # Calibration OU (vitesse et vol) ; cible = moyenne 12M : le mu OU = c/(1-phi) diverge près de la racine unitaire
         ou = MeanReversionModel()
         state = ou.calibrate_ou_model(ts_svf_12m, dt=1.0/TRADING_DAYS_IN_YEAR)
-        mu = state['mu'] if state['status'] == 'valid' else ts_svf_12m.mean()
+        ou_valid = state['status'] == 'valid'
+        mu = ts_svf_12m.mean()
         if np.isnan(current_svf) or np.isnan(mu):
             continue
+        if ou_valid:
+            ou.mu = mu  # premier passage mesuré jusqu'à la même cible que le gap
         fht = ou.compute_first_hitting_time(current_svf)
 
         if len(ts_svf_12m) > 10:
@@ -169,9 +174,25 @@ def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.Dat
             # d(gain net)/d(spread repo en bp) : carry_bps = (ytm - repo)·h·100/dur, donc -h/dur par bp, signé par la position
             leg_repo_sens.append(float(dir_sign * w * horizon_years / dur))
 
-        net_edge_bps = abs(target_gap) + net_carry_roll_3m_bps - total_bid_ask_cost_bps  # >0 : gain net attendu
+        # Gain attendu à l'horizon : convergence OU partielle (rien si pas de retour à la moyenne) + carry/roll - coûts
+        h_years = HOLDING_HORIZON_DAYS / TRADING_DAYS_IN_YEAR
+        expected_gain_bps = abs(target_gap) * (1 - np.exp(-state['theta'] * h_years)) if ou_valid else 0.0
+        net_edge_bps = expected_gain_bps + net_carry_roll_3m_bps - total_bid_ask_cost_bps  # >0 : gain net attendu
         carry_roll_adjusted_gap = dir_sign * net_edge_bps
-        net_edge_ratio = net_edge_bps / daily_vol if daily_vol > 0 else np.nan  # gain net en écarts-types du spread
+        # Risque du P&L : variations à h jours du spread de MARCHÉ (risque de courbe non couvert inclus)
+        risk_h_bps = horizon_risk(ts_market, HOLDING_HORIZON_DAYS, RISK_EWM_HALFLIFE_DAYS)
+        net_edge_ratio = net_edge_bps / risk_h_bps if risk_h_bps > 0 else np.nan  # Sharpe attendu à l'horizon
+
+        # Seuils optimaux sur Y = position favorable (gagne quand Y monte), Y0 = -|gap| ; coût d'un aller-retour
+        entry_band = exit_target = stop_loss = ll_gain = prob_target = exit_time = np.nan
+        if ou_valid:
+            theta, sigma, cost = state['theta'], state['sigma'], 2 * total_bid_ask_cost_bps
+            y0 = -abs(target_gap)
+            entry_band = bertram_entry_band(theta, sigma, cost)
+            b, L, ll_gain, prob_target = leung_li_exit(y0, theta, sigma, cost, STOP_LOSS_SD)
+            if np.isfinite(b):
+                exit_target, stop_loss = b - y0, y0 - L
+                exit_time = ou_exit_time(y0, L, b, theta, sigma) * TRADING_DAYS_IN_YEAR
 
         res = {
             'as_of_date': as_of_date,
@@ -195,7 +216,17 @@ def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.Dat
             'leg_repo_sens': json.dumps(leg_repo_sens),
             'bid_ask_cost_bps': total_bid_ask_cost_bps,
             'carry_roll_adjusted_gap': carry_roll_adjusted_gap,
+            'expected_gain_bps': expected_gain_bps,
+            'risk_h_bps': risk_h_bps,
             'net_edge_ratio': net_edge_ratio,
+            'entry_band_bps': entry_band,
+            'in_entry_zone': bool(abs(target_gap) >= entry_band) if np.isfinite(entry_band) else False,
+            'exit_target_bps': exit_target,
+            'stop_loss_bps': stop_loss,
+            'll_expected_gain_bps': ll_gain,
+            'prob_target': prob_target,
+            'exit_time_days': exit_time,
+            'gain_per_day_bps': ll_gain / exit_time if exit_time > 0 else np.nan,
             'ou_long_run_mean_bps': state['mu'],
             'ou_calibration_status': state['status'],
             'ou_theta': state['theta'],
@@ -280,5 +311,6 @@ def apply_repo_spreads(df: pd.DataFrame, spreads: dict) -> pd.DataFrame:
     df = df.copy()
     df['net_carry_roll_3m_bps'] += adj
     df['carry_roll_adjusted_gap'] += np.sign(df['target_gap_bps']) * adj
-    df['net_edge_ratio'] += adj / df['daily_vol_bps']
+    risk = df['risk_h_bps'].fillna(df['daily_vol_bps']) if 'risk_h_bps' in df.columns else df['daily_vol_bps']
+    df['net_edge_ratio'] += adj / risk  # parquets antérieurs : ratio sur daily_vol_bps
     return df
