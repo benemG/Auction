@@ -5,7 +5,8 @@ import sys
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from src.mean_reversion import (MeanReversionModel, horizon_risk, bertram_entry_band, leung_li_exit, ou_exit_time)
+from src.mean_reversion import (MeanReversionModel, horizon_risk, bertram_entry_band, leung_li_exit, ou_exit_time,
+                                market_share, quote_glitches)
 
 DT = 1.0 / 252
 
@@ -60,7 +61,7 @@ def test_exit_time_matches_first_hitting_time_density(theta):
 def test_leung_li_probability_matches_monte_carlo():
     y0 = -2 * S
     b, L, gain, p = leung_li_exit(y0, THETA, SIGMA, 2.0, 1.0)
-    assert y0 < b < 3 * S and L == pytest.approx(y0 - S)
+    assert y0 < b <= 0 and L == pytest.approx(y0 - S)  # objectif plafonné à la moyenne
     rng = np.random.default_rng(3)
     n, dt = 4000, DT / 20
     y, done, hit = np.full(n, y0), np.zeros(n, bool), np.zeros(n, bool)
@@ -109,3 +110,18 @@ def test_ou_calibration_and_fht():
     
     fht_zero = model.compute_first_hitting_time(state['mu'])
     assert fht_zero['expected_time'] == 0.0
+
+def test_market_share_separates_market_and_fit_driven_residuals():
+    rng = np.random.default_rng(1)
+    mkt = pd.Series(_ou(rng, 10).values + 50)
+    curve = pd.Series(_ou(rng, 10).values)
+    assert market_share(mkt, mkt - 50) == pytest.approx(1.0)            # courbe figée : tout vient du marché
+    assert abs(market_share(mkt * 0 + 50, curve)) < 1e-9                 # spread figé : tout vient de la courbe
+
+def test_quote_glitches_counts_reverting_spikes_only():
+    rng = np.random.default_rng(2)
+    s = pd.Series(np.cumsum(rng.normal(0, 1, 252)))
+    base = quote_glitches(s)
+    s.iloc[100] += 30            # cotation erronée isolée
+    s.iloc[200:] += 30           # vrai saut de niveau, qui ne revient pas
+    assert quote_glitches(s) == base + 1

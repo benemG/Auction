@@ -275,14 +275,16 @@ def leung_li_exit(y0: float, theta: float, sigma: float, cost: float, stop_sd: f
     """
     Sortie optimale b* (take-profit) avec stop-loss L = y0 - stop_sd·s (Leung & Li 2015), s = écart-type stationnaire.
     V(b) = L - cost + (b - L)·P(b avant L), P venant de la fonction d'échelle.
-    shortcut: actualisation r = 0 (limite de leurs fonctions F/G) : à l'ESTER sur quelques semaines l'écart est < 0,01 bp ;
-    passer à F/G si les horizons s'allongent.
+    shortcut: actualisation r = 0 (limite de leurs fonctions F/G) et objectif plafonné à la moyenne : sans coût d'attente,
+    b* partait au-delà de μ (sorties à ~2× la demi-vie ou plus) ; passer à F/G avec r > 0 pour arbitrer temps et gain.
     Retourne (b*, L, gain attendu net V(b*) - y0, P(b* avant L)) ; NaN si les erfi débordent (écart extrême).
     """
     s = sigma / np.sqrt(2 * theta)
     k = np.sqrt(theta) / sigma
     L = y0 - stop_sd * s
-    b = np.linspace(y0, max(3 * s, y0 + s), 301)[1:]
+    if y0 >= 0:
+        return np.nan, L, np.nan, np.nan
+    b = np.linspace(y0, 0, 301)[1:]
     with np.errstate(over='ignore', invalid='ignore'):
         p = (erfi(k * y0) - erfi(k * L)) / (erfi(k * b) - erfi(k * L))
     value = L - cost + (b - L) * p
@@ -305,6 +307,23 @@ def ou_exit_time(y0: float, lo: float, hi: float, theta: float, sigma: float, n:
     c = np.sqrt(np.pi) / theta * trapezoid(e * erf(w), w) / trapezoid(e, w)
     f = cumulative_trapezoid(e * (c - np.sqrt(np.pi) / theta * erf(w)), w, initial=0)
     return float(np.interp(y0 * k, w, f))
+
+def market_share(ts_market: pd.Series, ts_svf: pd.Series, h: int = 21) -> float:
+    """Part du mouvement du résidu portée par le spread de marché : β des variations à h jours du SvF sur celles du
+    spread. Le reste vient de la courbe fittée, qui ne paie rien (courbes d'agences peu peuplées)."""
+    d_svf = ts_svf.diff(h)
+    d_mkt = ts_market.reindex(ts_svf.index).diff(h)
+    v = d_svf.var()
+    return float(d_mkt.cov(d_svf) / v) if v > 0 else np.nan
+
+def quote_glitches(ts: pd.Series, k: float = 4.0) -> int:
+    """Jours où le spread saute de plus de k écarts-types robustes puis revient le lendemain : cotation erronée."""
+    d = ts.dropna().diff().dropna()
+    thr = k * 1.4826 * (d - d.median()).abs().median()
+    if not thr > 0:
+        return 0
+    nxt = d.shift(-1)
+    return int(((d.abs() > thr) & (nxt.abs() > thr) & (np.sign(d) != np.sign(nxt))).sum())
 
 from statsmodels.tsa.stattools import adfuller
 

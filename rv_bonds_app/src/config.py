@@ -50,6 +50,7 @@ BPS_MULTIPLIER = 10000.0
 
 # Mesures scannées et facteur de conversion vers les bps (le YTM est stocké en %, l'ASW en bps)
 METRIC_TO_BPS = {'asset_swap_spread': 1.0, 'ytm': 100.0}
+METRIC_LABELS = {'asset_swap_spread': 'ASW', 'ytm': 'YTM'}
 
 # Convention temporelle pour P-Spline et Mean Reversion (Actual/365.25 ou similaire)
 DAYS_IN_YEAR = 365.25
@@ -75,6 +76,9 @@ OU_DEFAULT_DT = 1.0 / TRADING_DAYS_IN_YEAR
 HOLDING_HORIZON_DAYS = 63     # horizon du gain attendu et du risque, aligné sur le carry/roll 3M
 RISK_EWM_HALFLIFE_DAYS = 21   # demi-vie de l'EWM de la vol quotidienne du spread de marché
 STOP_LOSS_SD = 1.0            # stop-loss Leung-Li : écarts-types stationnaires au-delà du point d'entrée
+# Le P&L réalisé à 3M vaut ~la moitié de la convergence OU prévue (univers du 02/01/2025, 61 000 trades) ; décoter
+# améliore aussi le classement (Spearman 0,27 -> 0,29). shortcut: une seule date, à recalibrer par le backtest (P2)
+EXPECTED_GAIN_HAIRCUT = 0.5
 
 # --- SCORING WEIGHTS ---
 SCORE_WEIGHTS = {

@@ -5,10 +5,10 @@ from .hedge_ratio import (compute_spread_hedge_ratio, compute_fly_hedge_ratio, c
                           parse_coupon, approx_modified_duration)
 from .momentum import compute_ewmac, compute_ewmac_series
 from .mean_reversion import (MeanReversionModel, compute_hurst_exponent, compute_adf_pvalue, horizon_risk,
-                             bertram_entry_band, leung_li_exit, ou_exit_time)
+                             bertram_entry_band, leung_li_exit, ou_exit_time, market_share, quote_glitches)
 from .scoring import calculate_confidence_score
 from .config import (TRADING_DAYS_IN_YEAR, SCORE_WEIGHTS, METRIC_TO_BPS, HOLDING_HORIZON_DAYS,
-                     RISK_EWM_HALFLIFE_DAYS, STOP_LOSS_SD)
+                     RISK_EWM_HALFLIFE_DAYS, STOP_LOSS_SD, EXPECTED_GAIN_HAIRCUT)
 
 def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.DataFrame, trades_def: list, as_of_date: pd.Timestamp, metric: str = 'asset_swap_spread') -> pd.DataFrame:
     """
@@ -151,6 +151,7 @@ def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.Dat
         # Position en bonds = -dir_sign * sw (long_spread = short bond1 / long bond2).
         horizon_years = 0.25
         net_carry_roll_3m_bps = 0.0
+        carry_3m_bps = 0.0  # carry seul : le roll est déjà dans la variation réalisée du spread (P&L du Trade Explorer)
         total_bid_ask_cost_bps = 0.0
         leg_issuers, leg_repo_sens = [], []  # pour apply_repo_spreads : spread de repo appliqué à l'affichage seulement
         for w, isin, ttm in zip(sw, isins, ttm_list):
@@ -170,13 +171,14 @@ def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.Dat
                 roll_bps = (np.interp(ttm, x, y) - np.interp(ttm - horizon_years, x, y)) * 100
 
             net_carry_roll_3m_bps += -dir_sign * w * (carry_bps + roll_bps)
+            carry_3m_bps += -dir_sign * w * carry_bps
             leg_issuers.append(str(current_market.loc[isin, 'issuer']) if 'issuer' in current_market.columns else '')
             # d(gain net)/d(spread repo en bp) : carry_bps = (ytm - repo)·h·100/dur, donc -h/dur par bp, signé par la position
             leg_repo_sens.append(float(dir_sign * w * horizon_years / dur))
 
         # Gain attendu à l'horizon : convergence OU partielle (rien si pas de retour à la moyenne) + carry/roll - coûts
         h_years = HOLDING_HORIZON_DAYS / TRADING_DAYS_IN_YEAR
-        expected_gain_bps = abs(target_gap) * (1 - np.exp(-state['theta'] * h_years)) if ou_valid else 0.0
+        expected_gain_bps = EXPECTED_GAIN_HAIRCUT * abs(target_gap) * (1 - np.exp(-state['theta'] * h_years)) if ou_valid else 0.0
         net_edge_bps = expected_gain_bps + net_carry_roll_3m_bps - total_bid_ask_cost_bps  # >0 : gain net attendu
         carry_roll_adjusted_gap = dir_sign * net_edge_bps
         # Risque du P&L : variations à h jours du spread de MARCHÉ (risque de courbe non couvert inclus)
@@ -212,6 +214,9 @@ def generate_opportunities_for_issuer(df_market: pd.DataFrame, df_fitted: pd.Dat
             'spread_target_bps': target,
             'target_gap_bps': target_gap,
             'net_carry_roll_3m_bps': net_carry_roll_3m_bps,
+            'carry_3m_bps': carry_3m_bps,
+            'market_share': market_share(ts_market, ts_svf_12m),
+            'quote_glitches_12m': quote_glitches(ts_market.dropna().tail(252)),
             'leg_issuers': json.dumps(leg_issuers),
             'leg_repo_sens': json.dumps(leg_repo_sens),
             'bid_ask_cost_bps': total_bid_ask_cost_bps,

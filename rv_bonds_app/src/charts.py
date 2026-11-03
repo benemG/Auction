@@ -152,102 +152,75 @@ def plot_pspline_curve(df_day: pd.DataFrame, metric: str = 'ytm'):
     return fig
 from plotly.subplots import make_subplots
 
-def plot_combined_trade_analysis(df: pd.DataFrame, spread_col: str, fitted_col: str, current_val: float, mu: float, theta: float, sigma: float):
+def plot_trade_performance(df: pd.DataFrame, as_of, trade: pd.Series, pre: int = 252, post: int = 126):
     """
-    Graphique unique combinant :
-    - Spread historique (Axe Gauche)
-    - Spread P-Spline Cible (Axe Gauche)
-    - Forecast OU avec bandes de confiance (Axe Gauche, dans le futur)
-    - Résidus (Market - Cible) (Axe Droit)
+    Trois panneaux autour de l'entrée (date d'analyse, trait noir ; horizon 3M en pointillé) :
+    - spread de marché : gris sur les 12 mois de calibration, bleu foncé après l'entrée, cible = courbe du jour + μ, stop ;
+    - P&L dans le sens du trade (carry inclus, coûts déduits) face à l'attendu (convergence décotée + carry/roll) ±1σ ;
+    - résidu vs courbe (SvF) avec μ et ±2σ : montre si le spread converge ou si c'est la courbe qui bouge.
+    Sans données postérieures à l'entrée (dernière date), seuls l'attendu et le cône sont tracés.
     """
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    # --- 1. HISTORIQUE ---
-    # Market Spread
-    fig.add_trace(go.Scatter(
-        x=df['date'], y=df[spread_col], 
-        mode='lines', name='Market Spread (bps)',
-        line=dict(color='blue', width=2)
-    ), secondary_y=False)
-    
-    # P-Spline Target
-    fig.add_trace(go.Scatter(
-        x=df['date'], y=df[fitted_col], 
-        mode='lines', name='P-Spline Target (bps)',
-        line=dict(color='red', dash='dash')
-    ), secondary_y=False)
-    
-    # Résidus
-    residuals = df[spread_col] - df[fitted_col]
-    fig.add_trace(go.Bar(
-        x=df['date'], y=residuals,
-        name='Residuals (bps)',
-        marker_color='rgba(128, 128, 128, 0.4)'
-    ), secondary_y=True)
+    from .config import TRADING_DAYS_IN_YEAR, HOLDING_HORIZON_DAYS as H, EXPECTED_GAIN_HAIRCUT
+    GREY, BLUE, GREEN, RED = '#9e9e9e', '#0b2e59', '#2e7d32', '#c62828'
+    g = lambda k, d=np.nan: d if pd.isna(trade.get(k, np.nan)) else trade[k]
+    as_of = pd.Timestamp(as_of)
+    df = df.set_index('date').sort_index()
+    s, svf = df['spread_market'], df['spread_market'] - df['spread_fitted']
+    s_pre, s_post = s[s.index <= as_of].tail(pre), s[s.index >= as_of].head(post + 1)
+    v_pre, v_post = svf[svf.index <= as_of].tail(pre), svf[svf.index >= as_of].head(post + 1)
+    d, s0 = np.sign(g('target_gap_bps', 0.0)), g('spread_market_bps')
+    mu = g('spread_target_bps') - g('spread_fitted_bps')
+    x_fwd = pd.bdate_range(as_of, periods=post + 1)
+    end = max(x_fwd[-1], s_post.index[-1]) if len(s_post) else x_fwd[-1]
 
-    # --- 2. FORECAST OU ---
-    if not (np.isnan(mu) or np.isnan(theta) or np.isnan(sigma) or theta <= 0):
-        last_date = df['date'].max()
-        
-        # Horizons en années
-        horizons = np.linspace(0, 1.0, 100) # Jusqu'à 1 an
-        
-        # E[X_t]
-        exp_t = current_val * np.exp(-theta * horizons) + mu * (1 - np.exp(-theta * horizons))
-        
-        # Volatilité
-        vol_t = np.sqrt((sigma**2 / (2 * theta)) * (1 - np.exp(-2 * theta * horizons)))
-        
-        upper_1 = exp_t + vol_t
-        lower_1 = exp_t - vol_t
-        upper_2 = exp_t + 2 * vol_t
-        lower_2 = exp_t - 2 * vol_t
-        
-        # Conversion horizons en jours calendaires pour l'axe X
-        # (horizons * 365) jours calendaires
-        future_dates = [last_date + pd.Timedelta(days=int(h * 365)) for h in horizons]
-        
-        # Bandes 2 sigmas
-        fig.add_trace(go.Scatter(
-            x=future_dates + future_dates[::-1],
-            y=np.concatenate([upper_2, lower_2[::-1]]),
-            fill='toself', fillcolor='rgba(200,200,200,0.3)',
-            line=dict(color='rgba(255,255,255,0)'),
-            name='± 2 std',
-            showlegend=True
-        ), secondary_y=False)
-        
-        # Bandes 1 sigma
-        fig.add_trace(go.Scatter(
-            x=future_dates + future_dates[::-1],
-            y=np.concatenate([upper_1, lower_1[::-1]]),
-            fill='toself', fillcolor='rgba(150,150,150,0.4)',
-            line=dict(color='rgba(255,255,255,0)'),
-            name='± 1 std',
-            showlegend=True
-        ), secondary_y=False)
-        
-        # Espérance
-        fig.add_trace(go.Scatter(
-            x=future_dates, y=exp_t, 
-            mode='lines', name='Expected OU Trajectory',
-            line=dict(color='green', width=2)
-        ), secondary_y=False)
-        
-        # Ligne Mu
-        fig.add_hline(y=mu, line_dash="dot", annotation_text="OU Long Run Mean", line_color="green", secondary_y=False)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.45, 0.3, 0.25],
+                        subplot_titles=('Spread de marché (bp)', 'P&L dans le sens du trade (bp) : réalisé vs attendu',
+                                        'Résidu vs courbe (SvF, bp)'))
+    # 1. Spread
+    fig.add_trace(go.Scatter(x=s_pre.index, y=s_pre, line=dict(color=GREY, width=1.3), name='Historique 12M'), 1, 1)
+    if len(s_post) > 1:
+        fig.add_trace(go.Scatter(x=s_post.index, y=s_post, line=dict(color=BLUE, width=2.2), name='Après entrée'), 1, 1)
+    tgt = (df['spread_fitted'] + mu)[s_pre.index[0]:] if len(s_pre) else df['spread_fitted'].iloc[:0]
+    fig.add_trace(go.Scatter(x=tgt.index, y=tgt, line=dict(color=GREEN, width=1), opacity=0.7,
+                             name='Cible (courbe du jour + μ)'), 1, 1)
+    # Stop projeté à courbe inchangée ; l'objectif (μ) est la cible verte
+    stop = s0 - d * g('stop_loss_bps')
+    if np.isfinite(stop):
+        fig.add_trace(go.Scatter(x=[as_of, end], y=[stop, stop], mode='lines', name='Stop',
+                                 line=dict(color=RED, dash='dot', width=1.2)), 1, 1)
 
-    fig.update_layout(
-        title="Analyse du Spread & Projection Ornstein-Uhlenbeck",
-        xaxis_title="Date",
-        template="plotly_white",
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    
-    fig.update_yaxes(title_text="Spread (bps)", secondary_y=False)
-    fig.update_yaxes(title_text="Residuals (bps)", secondary_y=True, showgrid=False)
-    
+    # 2. P&L attendu et réalisé
+    t = np.arange(post + 1)
+    theta = g('ou_theta', 0.0) if trade.get('ou_calibration_status') == 'valid' else 0.0
+    cost = g('bid_ask_cost_bps', 0.0)
+    exp = (EXPECTED_GAIN_HAIRCUT * abs(g('target_gap_bps', 0.0)) * (1 - np.exp(-theta * t / TRADING_DAYS_IN_YEAR))
+           + g('net_carry_roll_3m_bps', 0.0) * t / H - cost)
+    sd = g('risk_h_bps', 0.0) * np.sqrt(t / H)  # shortcut: diffusion en √t, surestime le risque d'un spread qui revient vite
+    fig.add_trace(go.Scatter(x=list(x_fwd) + list(x_fwd[::-1]), y=list(exp + sd) + list((exp - sd)[::-1]),
+                             fill='toself', fillcolor='rgba(11,46,89,0.10)', line=dict(width=0), name='Attendu ±1σ'), 2, 1)
+    fig.add_trace(go.Scatter(x=x_fwd, y=exp, line=dict(color=BLUE, dash='dash', width=1), name='Attendu'), 2, 1)
+    if len(s_post) > 1:
+        pnl = d * (s_post - s0) + g('carry_3m_bps', 0.0) * np.arange(len(s_post)) / H - cost
+        fig.add_trace(go.Scatter(x=pnl.index, y=pnl, line=dict(color=BLUE, width=2.2), name='P&L réalisé'), 2, 1)
+    fig.add_hline(y=0, line=dict(color='#bbb', width=1), row=2, col=1)
+
+    # 3. Résidu
+    fig.add_trace(go.Scatter(x=v_pre.index, y=v_pre, line=dict(color=GREY, width=1.3), showlegend=False), 3, 1)
+    if len(v_post) > 1:
+        fig.add_trace(go.Scatter(x=v_post.index, y=v_post, line=dict(color=BLUE, width=2.2), showlegend=False), 3, 1)
+    sd_svf = v_pre.std()
+    x0 = v_pre.index[0] if len(v_pre) else as_of
+    for y, col in [(mu, GREEN), (mu + 2 * sd_svf, '#bbb'), (mu - 2 * sd_svf, '#bbb')]:
+        fig.add_trace(go.Scatter(x=[x0, end], y=[y, y], mode='lines', showlegend=False, hoverinfo='skip',
+                                 line=dict(color=col, dash='dash', width=1)), 3, 1)
+
+    for row in (1, 2, 3):
+        fig.add_vline(x=as_of.timestamp() * 1000, line=dict(color='black', width=1.5), row=row, col=1)
+        fig.add_vline(x=x_fwd[H].timestamp() * 1000, line=dict(color='#999', width=1, dash='dot'), row=row, col=1)
+    # Fond blanc explicite : le bleu foncé et le trait noir d'entrée resteraient illisibles sur le thème sombre
+    fig.update_layout(height=760, template='plotly_white', hovermode='x unified', paper_bgcolor='white',
+                      plot_bgcolor='white', font=dict(color='#222'),
+                      legend=dict(orientation='h', yanchor='bottom', y=1.04, xanchor='right', x=1))
     return fig
 
 import networkx as nx

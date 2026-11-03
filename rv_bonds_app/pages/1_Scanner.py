@@ -8,10 +8,9 @@ import itertools
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from src.data_io import read_opportunities, OPPORTUNITIES_DIR
-from src.config import MARKET_DATA_DIR, MIN_Z_SCORE_ENTRY, get_repo_spreads
+from src.config import MARKET_DATA_DIR, MIN_Z_SCORE_ENTRY, METRIC_LABELS, get_repo_spreads
 from src.opportunity_generation import apply_repo_spreads
 
-METRIC_LABELS = {'asset_swap_spread': 'ASW', 'ytm': 'YTM'}
 
 st.set_page_config(page_title="Scanner", page_icon="🔍", layout="wide")
 st.title("Scanner d'Opportunités RV")
@@ -140,6 +139,7 @@ st.write(f'### Resultats : {len(df_filtered)} opportunites')
 display_cols = [
     'trade_id', 'metric', 'issuer', 'recommended_direction', 'net_edge_ratio', 'confidence_score', 'zscore_12m',
     'expected_gain_bps', 'risk_h_bps', 'net_carry_roll_3m_bps', 'half_life_days',
+    'market_share', 'quote_glitches_12m',
     'exit_target_bps', 'stop_loss_bps', 'exit_time_days', 'gain_per_day_bps', 'residual_dv01'
 ]
 
@@ -155,9 +155,11 @@ column_config = {
     "trade_type": st.column_config.TextColumn("Type"),
     "recommended_direction": st.column_config.TextColumn("Direction"),
     "net_edge_ratio": st.column_config.NumberColumn("Gain net / risque 3M", help="(gain attendu 3M + carry/roll - coûts) / risque 3M du spread de marché ; trié par défaut", format="%.2f"),
-    "expected_gain_bps": st.column_config.NumberColumn("Gain attendu 3M (bps)", help="|écart| × (1 - e^(-θ·3M)), demi-vie corrigée du biais", format="%.2f"),
+    "expected_gain_bps": st.column_config.NumberColumn("Gain attendu 3M (bps)", help="décote × |écart| × (1 - e^(-θ·3M)), demi-vie corrigée du biais ; décote 0,5 mesurée sur le réalisé", format="%.2f"),
+    "market_share": st.column_config.NumberColumn("Part marché", help="Part du mouvement du résidu portée par le spread de marché (le reste vient de la courbe fittée)", format="percent"),
+    "quote_glitches_12m": st.column_config.NumberColumn("Cotations erronées 12M", help="Sauts > 4 écarts-types robustes qui reviennent le lendemain", format="%d"),
     "risk_h_bps": st.column_config.NumberColumn("Risque 3M (bps)", help="Écart-type des variations à 3M du spread de marché (vol EWM × ratio de variance)", format="%.2f"),
-    "exit_target_bps": st.column_config.NumberColumn("Objectif (bps)", help="Mouvement visé jusqu'à la sortie optimale Leung-Li", format="%.2f"),
+    "exit_target_bps": st.column_config.NumberColumn("Objectif (bps)", help="Mouvement visé jusqu'à la sortie Leung-Li, plafonnée à la moyenne μ", format="%.2f"),
     "stop_loss_bps": st.column_config.NumberColumn("Stop (bps)", help="Mouvement adverse avant stop-loss", format="%.2f"),
     "exit_time_days": st.column_config.NumberColumn("Durée attendue (j)", help="Temps moyen avant objectif ou stop (premier passage OU)", format="%.0f"),
     "gain_per_day_bps": st.column_config.NumberColumn("Gain / jour (bps)", help="Gain attendu Leung-Li / durée attendue", format="%.3f"),
